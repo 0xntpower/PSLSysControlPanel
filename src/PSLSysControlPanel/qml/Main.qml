@@ -862,26 +862,57 @@ ApplicationWindow {
                     // every new tail so what's visible is always the current
                     // component's fresh stream, never a stale snapshot.
                     Rectangle {
+                        id: miniLogPane
                         Layout.preferredWidth: 420
                         Layout.fillHeight: true
                         radius: 10
                         color: theme.bgSurface
                         border.color: theme.border; border.width: 1
 
+                        // Selectable + horizontally-scrollable mini-log.
+                        // Backed by a TextArea so operators can highlight
+                        // and copy text; wrapped in a ScrollView so long
+                        // lines can be scrolled sideways. Cap and prefix-
+                        // compaction are done in JS before append.
                         property int miniMaxLines: 40
-                        ListModel { id: miniLogModel }
+                        property int miniLineCount: 0
+
+                        function miniAppend(line) {
+                            if (!line) return;
+                            // Compact ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL  ]
+                            // module.path: msg`` → ``HH:MM:SS [LEVEL] msg``.
+                            // Raw pass-through for non-matching lines so
+                            // stack traces and foreign formats still show.
+                            var re = /^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
+                            var m = line.match(re);
+                            var out = m ? (m[1] + " [" + m[2] + "] " + m[3]) : line;
+                            if (miniTextArea.length > 0) miniTextArea.append(out);
+                            else miniTextArea.text = out;
+                            miniLineCount += 1;
+                            while (miniLineCount > miniMaxLines) {
+                                var nl = miniTextArea.text.indexOf("\n");
+                                if (nl < 0) break;
+                                miniTextArea.remove(0, nl + 1);
+                                miniLineCount -= 1;
+                            }
+                        }
+
+                        function miniLogClear() {
+                            miniTextArea.clear();
+                            miniLineCount = 0;
+                        }
 
                         // Row change: stop whichever tail is active, close
                         // the overlay if it was open for the previous row,
-                        // clear both models, and let the retry timer re-arm
-                        // the mini for the new row once its log_files land.
+                        // clear both views, let the retry timer re-arm the
+                        // mini for the new row once its log_files land.
                         Connections {
                             target: root
                             function onSelectedIndexChanged() {
                                 if (agentClient) agentClient.stopLogTail();
                                 root.miniTailActive = false;
-                                miniLogModel.clear();
-                                tailModel.clear();
+                                miniLogPane.miniLogClear();
+                                logsOverlay.tailClear();
                                 logsOverlay.streaming = false;
                                 if (root.overlay === "logs") root.overlay = "";
                                 miniRetry.restart();
@@ -889,20 +920,16 @@ ApplicationWindow {
                         }
 
                         // The mini-log and the overlay both listen to the
-                        // same AgentClient signals — writes are independent,
-                        // each has its own ListModel with its own cap.
+                        // same AgentClient signals — writes are independent.
                         Connections {
                             target: hostManager.currentClient
                             function onLogTailStarted(row, path) {
                                 if (row !== root.selectedIndex) return;
-                                miniLogModel.clear();
+                                miniLogPane.miniLogClear();
                             }
                             function onLogTailLine(row, lineNo, text) {
                                 if (row !== root.selectedIndex) return;
-                                miniLogModel.append({text: lineNo + "  " + text});
-                                while (miniLogModel.count > miniMaxLines)
-                                    miniLogModel.remove(0);
-                                miniLogList.positionViewAtEnd();
+                                miniLogPane.miniAppend(lineNo + "  " + text);
                             }
                             function onLogTailBytes(row, offset, data) {
                                 if (row !== root.selectedIndex) return;
@@ -913,18 +940,10 @@ ApplicationWindow {
                                 }
                                 var lines = String(s).split(/\r?\n/);
                                 for (var i = 0; i < lines.length; ++i) {
-                                    if (lines[i].length > 0)
-                                        miniLogModel.append({text: lines[i]});
+                                    if (lines[i].length > 0) miniLogPane.miniAppend(lines[i]);
                                 }
-                                while (miniLogModel.count > miniMaxLines)
-                                    miniLogModel.remove(0);
-                                miniLogList.positionViewAtEnd();
                             }
                             function onLogTailEnded(row, reason) {
-                                // Flag the mini slot as free regardless of
-                                // which consumer owned the ended session —
-                                // the retry timer will re-take it if the
-                                // overlay isn't streaming.
                                 root.miniTailActive = false;
                                 miniRetry.restart();
                             }
@@ -955,50 +974,36 @@ ApplicationWindow {
                                 }
                             }
 
-                            ListView {
-                                id: miniLogList
+                            Flickable {
+                                id: miniScroll
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 clip: true
-                                model: miniLogModel
+                                contentWidth: Math.max(width, miniTextArea.implicitWidth + 12)
+                                contentHeight: Math.max(height, miniTextArea.implicitHeight + 12)
+                                flickableDirection: Flickable.HorizontalAndVerticalFlick
                                 boundsBehavior: Flickable.StopAtBounds
-                                spacing: 2
-                                // Stick to the bottom as new lines arrive,
-                                // unless the operator has scrolled up.
-                                property bool stickToBottom: true
-                                onContentYChanged: {
-                                    if (!moving && !flicking) return;
-                                    stickToBottom = atYEnd;
-                                }
-                                onCountChanged: {
-                                    if (stickToBottom) Qt.callLater(positionViewAtEnd);
-                                }
 
-                                delegate: Text {
-                                    width: miniLogList.width
-                                    // Compact the noisy prefix so the message
-                                    // itself gets most of the column.
-                                    // ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL  ] module.path: msg``
-                                    // becomes ``HH:MM:SS [LEVEL] msg``. Falls
-                                    // back to the raw line if it doesn't match
-                                    // (e.g. lines from a non-Python component
-                                    // or continuation lines from multi-line
-                                    // stack traces).
-                                    text: {
-                                        var s = model.text;
-                                        var re = /^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
-                                        var m = s.match(re);
-                                        return m ? (m[1] + " [" + m[2] + "] " + m[3]) : s;
-                                    }
-                                    color: text.indexOf("WARN") >= 0
-                                               ? theme.warning
-                                         : text.indexOf("ERROR") >= 0
-                                               ? theme.danger
-                                         : theme.textMuted
-                                    font.pixelSize: 11
+                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                                TextEdit {
+                                    id: miniTextArea
+                                    readOnly: true
+                                    selectByMouse: true
+                                    selectByKeyboard: true
+                                    wrapMode: TextEdit.NoWrap
+                                    textFormat: TextEdit.PlainText
+                                    color: theme.textMuted
+                                    selectedTextColor: theme.textPrimary
+                                    selectionColor: theme.accentDim
                                     font.family: "Consolas"
-                                    wrapMode: Text.NoWrap
-                                    elide: Text.ElideRight
+                                    font.pixelSize: 11
+                                    onTextChanged: Qt.callLater(snapToEnd)
+                                    function snapToEnd() {
+                                        miniScroll.contentY = Math.max(
+                                            0, miniScroll.contentHeight - miniScroll.height);
+                                    }
                                 }
                             }
                         }
@@ -1420,7 +1425,31 @@ ApplicationWindow {
         property string activePath: ""
         property int maxLines: 2000
 
-        ListModel { id: tailModel }
+        // Line bookkeeping for the selectable TextArea backing this view.
+        // Using TextArea (instead of a ListView+Text delegate) makes the
+        // content natively selectable via mouse / keyboard and gives us
+        // horizontal scrolling for free via the wrapping ScrollView.
+        // ``lineCount`` is tracked so we can trim the top of the buffer
+        // when we exceed ``maxLines`` without scanning the whole string.
+        property int lineCount: 0
+
+        function tailAppend(line) {
+            if (!line) return;
+            if (tailTextArea.length > 0) tailTextArea.append(line);
+            else tailTextArea.text = line;
+            lineCount += 1;
+            while (lineCount > maxLines) {
+                var nl = tailTextArea.text.indexOf("\n");
+                if (nl < 0) break;
+                tailTextArea.remove(0, nl + 1);
+                lineCount -= 1;
+            }
+        }
+
+        function tailClear() {
+            tailTextArea.clear();
+            lineCount = 0;
+        }
 
         Connections {
             target: hostManager.currentClient
@@ -1428,14 +1457,12 @@ ApplicationWindow {
                 if (row !== root.selectedIndex) return;
                 logsOverlay.streaming = true;
                 logsOverlay.activePath = path;
-                tailModel.clear();
-                tailModel.append({text: "— streaming " + path + " —"});
+                logsOverlay.tailClear();
+                logsOverlay.tailAppend("— streaming " + path + " —");
             }
             function onLogTailLine(row, lineNo, text) {
                 if (row !== root.selectedIndex) return;
-                tailModel.append({text: lineNo + "  " + text});
-                while (tailModel.count > logsOverlay.maxLines) tailModel.remove(0);
-                tailList.positionViewAtEnd();
+                logsOverlay.tailAppend(lineNo + "  " + text);
             }
             function onLogTailBytes(row, offset, data) {
                 if (row !== root.selectedIndex) return;
@@ -1446,14 +1473,12 @@ ApplicationWindow {
                 }
                 var lines = String(text).split(/\r?\n/);
                 for (var i = 0; i < lines.length; ++i) {
-                    if (lines[i].length > 0) tailModel.append({text: lines[i]});
+                    if (lines[i].length > 0) logsOverlay.tailAppend(lines[i]);
                 }
-                while (tailModel.count > logsOverlay.maxLines) tailModel.remove(0);
-                tailList.positionViewAtEnd();
             }
             function onLogTailEnded(row, reason) {
                 logsOverlay.streaming = false;
-                tailModel.append({text: "— ended: " + reason + " —"});
+                logsOverlay.tailAppend("— ended: " + reason + " —");
             }
         }
 
@@ -1578,39 +1603,42 @@ ApplicationWindow {
                     border.width: 1
                     radius: 4
 
-                    ListView {
-                        id: tailList
+                    // Flickable + TextEdit: the classic scrollable log
+                    // pattern that works reliably in Qt 6. TextEdit's
+                    // implicit size grows with content; Flickable uses
+                    // those dimensions as contentWidth/Height so both
+                    // axes scroll when lines exceed the viewport.
+                    // TextEdit.selectByMouse makes the text selectable.
+                    Flickable {
+                        id: tailScroll
                         anchors.fill: parent
                         anchors.margins: 8
-                        model: tailModel
                         clip: true
+                        contentWidth: Math.max(width, tailTextArea.implicitWidth + 12)
+                        contentHeight: Math.max(height, tailTextArea.implicitHeight + 12)
+                        flickableDirection: Flickable.HorizontalAndVerticalFlick
                         boundsBehavior: Flickable.StopAtBounds
-                        // Stick to the bottom whenever a new line arrives —
-                        // unless the operator has scrolled up to read
-                        // history, in which case we leave them alone.
-                        // ``atYEnd`` is only accurate after layout, so
-                        // ``Qt.callLater`` defers the scroll to the next
-                        // event-loop tick.
-                        property bool stickToBottom: true
-                        onContentYChanged: {
-                            if (!moving && !flicking) return;
-                            stickToBottom = atYEnd;
-                        }
-                        onCountChanged: {
-                            if (stickToBottom) Qt.callLater(positionViewAtEnd);
-                        }
-                        delegate: Text {
-                            // Direct model-role access avoids the Text.text /
-                            // required-property-named-text collision entirely.
-                            // ListModel rows added as {text: "..."} expose
-                            // the value via ``model.text`` in the delegate.
-                            width: tailList.width
-                            text: model.text
+
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                        TextEdit {
+                            id: tailTextArea
+                            readOnly: true
+                            selectByMouse: true
+                            selectByKeyboard: true
+                            wrapMode: TextEdit.NoWrap
+                            textFormat: TextEdit.PlainText
                             color: theme.textPrimary
+                            selectedTextColor: theme.textPrimary
+                            selectionColor: theme.accentDim
                             font.family: "Consolas"
                             font.pixelSize: 12
-                            wrapMode: Text.NoWrap
-                            elide: Text.ElideRight
+                            onTextChanged: Qt.callLater(snapToEnd)
+                            function snapToEnd() {
+                                tailScroll.contentY = Math.max(
+                                    0, tailScroll.contentHeight - tailScroll.height);
+                            }
                         }
                     }
                 }
