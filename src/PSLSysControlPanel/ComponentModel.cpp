@@ -1,5 +1,7 @@
 #include "ComponentModel.hpp"
 
+#include "net/AgentClient.hpp"
+
 #include <QDateTime>
 #include <QtMath>
 
@@ -32,6 +34,7 @@ QString TimestampNow()
 ComponentModel::ComponentModel(QObject* parent)
     : QAbstractListModel(parent)
     , tickCount_(0)
+    , agent_client_(nullptr)
 {
     const QList<std::tuple<QString, QString, ComponentStatus, double, double>> seed{
         {"PolyDataCollector",   "vps-01",   ComponentStatus::Running,  142.0, 8.1},
@@ -63,6 +66,57 @@ ComponentModel::ComponentModel(QObject* parent)
     tickTimer_.setInterval(1000);
     QObject::connect(&tickTimer_, &QTimer::timeout, this, &ComponentModel::Tick);
     tickTimer_.start();
+}
+
+void ComponentModel::attachAgent(net::AgentClient* client)
+{
+    agent_client_ = client;
+    // Stop the synthetic ticker — real data will flow via the agent.
+    tickTimer_.stop();
+    if (client == nullptr) {
+        return;
+    }
+    QObject::connect(client, &net::AgentClient::componentListUpdated,
+                     this, &ComponentModel::SyncFromAgent);
+    // In case the agent already has data cached.
+    SyncFromAgent();
+}
+
+void ComponentModel::SyncFromAgent()
+{
+    if (agent_client_ == nullptr) {
+        return;
+    }
+    const QList<net::AgentClient::ComponentInfo> src = agent_client_->components();
+    beginResetModel();
+    rows_.clear();
+    for (const auto& ci : src) {
+        ComponentRow r;
+        r.name = ci.display_name.isEmpty() ? ci.id : ci.display_name;
+        r.host = ci.telemetry_endpoint;
+        r.status = StatusFromString(ci.state);
+        r.uptimeSec = 0;
+        // Starting-at-seconds-since-epoch is provided by the agent but we
+        // surface uptime in the UI; compute rough uptime from wall clock.
+        if (ci.started_at > 0) {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            r.uptimeSec = std::max<qint64>(0, now - ci.started_at);
+        }
+        r.eventsPerSec = 0.0;
+        r.cpuPct = 0.0;
+        r.queueDepth = 0;
+        rows_.append(std::move(r));
+    }
+    endResetModel();
+}
+
+ComponentStatus ComponentModel::StatusFromString(const QString& s)
+{
+    if (s == "running")   return ComponentStatus::Running;
+    if (s == "starting")  return ComponentStatus::Starting;
+    if (s == "stopping")  return ComponentStatus::Running;  // UI lumps stopping→running-ish
+    if (s == "crashed")   return ComponentStatus::Crashed;
+    return ComponentStatus::Stopped;
 }
 
 int ComponentModel::rowCount(const QModelIndex& parent) const

@@ -9,6 +9,10 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+namespace pslcp::net {
+class AgentClient;
+} // namespace pslcp::net
+
 namespace pslcp {
 
 enum class ComponentStatus : int {
@@ -50,6 +54,13 @@ public:
 
     explicit ComponentModel(QObject* parent = nullptr);
 
+    // Attach a real agent client. Once attached, the model stops its
+    // synthetic ticker and sources ``id``/``display_name``/``state`` from
+    // the agent's ``component_list`` responses. The detail-pane-specific
+    // fields (events/sec, CPU, queue, chart, logs) remain empty until a
+    // future phase hooks up log_tail + telemetry aggregation.
+    void attachAgent(net::AgentClient* client);
+
     int rowCount(const QModelIndex& parent = QModelIndex()) const override;
     QVariant data(const QModelIndex& index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
@@ -63,13 +74,16 @@ public:
 
 private:
     void Tick();
+    void SyncFromAgent();
     static QString FormatUptime(qint64 sec);
     static QString StatusText(ComponentStatus s);
+    static ComponentStatus StatusFromString(const QString& s);
     void PushLog(int row, const QString& line);
 
     QList<ComponentRow> rows_;
     QTimer tickTimer_;
     qint64 tickCount_;
+    net::AgentClient* agent_client_;
 };
 
 } // namespace pslcp
