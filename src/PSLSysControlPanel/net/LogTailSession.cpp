@@ -134,8 +134,16 @@ void LogTailSession::onReadyRead()
         } else if (t.endsWith(QStringLiteral(".err"))) {
             if (!ended_emitted_) {
                 ended_emitted_ = true;
-                emit ended(row_,
-                            r.payload.body.value(QStringLiteral("message")).toString());
+                // Prefix the reason with the error code so the AgentClient
+                // can route on ``bad_op_signature`` without a new signal
+                // parameter. Empty-code responses pass the message through.
+                const QString code =
+                    r.payload.body.value(QStringLiteral("code")).toString();
+                const QString msg =
+                    r.payload.body.value(QStringLiteral("message")).toString();
+                const QString reason =
+                    code.isEmpty() ? msg : (code + QStringLiteral(": ") + msg);
+                emit ended(row_, reason);
             }
             stop();
             return;

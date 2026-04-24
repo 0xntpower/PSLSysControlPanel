@@ -467,7 +467,7 @@ void AgentClient::startLogTail(int row, const QString& path,
     connect(log_tail_session_, &LogTailSession::bytesChunk,
             this, &AgentClient::logTailBytes);
     connect(log_tail_session_, &LogTailSession::ended,
-            this, &AgentClient::logTailEnded);
+            this, &AgentClient::onLogTailSessionEnded);
     log_tail_session_->start(host_, port_);
 }
 
@@ -619,7 +619,11 @@ void AgentClient::handleFrame(const QByteArray& frame_body)
     if (t.endsWith(QStringLiteral(".err"))) {
         const QString msg = r.payload.body.value(QStringLiteral("message")).toString();
         const QString code = r.payload.body.value(QStringLiteral("code")).toString();
-        setError(QStringLiteral("%1: %2 (%3)").arg(t, msg, code));
+        if (code == QStringLiteral("bad_op_signature")) {
+            handleOperatorRejected();
+        } else {
+            setError(QStringLiteral("%1: %2 (%3)").arg(t, msg, code));
+        }
         return;
     }
     // Unhandled types are ignored for v0 — panel only consumes a subset.
@@ -665,6 +669,30 @@ void AgentClient::setError(const QString& msg)
 {
     last_error_ = msg;
     emit lastErrorChanged();
+}
+
+void AgentClient::handleOperatorRejected()
+{
+    // Drop the cached key, flip the auth flag. Any QML auto-tail / other
+    // background retry that was racing on operatorAuthenticated will
+    // short-circuit on the next tick since the property is now false.
+    if (!operator_key_.isEmpty()) {
+        std::fill(operator_key_.begin(), operator_key_.end(), static_cast<char>(0));
+        operator_key_.clear();
+        emit operatorAuthenticatedChanged();
+    }
+    setError(QStringLiteral(
+        "operator password rejected — please re-authenticate"));
+    // Any in-flight log_tail on its secondary connection is already
+    // terminating from the agent's .err response; no explicit stop needed.
+}
+
+void AgentClient::onLogTailSessionEnded(int row, const QString& reason)
+{
+    if (reason.startsWith(QStringLiteral("bad_op_signature"))) {
+        handleOperatorRejected();
+    }
+    emit logTailEnded(row, reason);
 }
 
 } // namespace pslcp::net

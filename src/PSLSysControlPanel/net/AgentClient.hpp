@@ -160,6 +160,13 @@ private slots:
     void onSocketDisconnected();
     void onSocketErrorOccurred();
 
+private slots:
+    // Internal forwarder for LogTailSession::ended — inspects the reason
+    // prefix for ``bad_op_signature`` so a wrong operator password on
+    // the first log_tail doesn't thrash the agent with reconnect
+    // attempts. Clears the operator key when matched.
+    void onLogTailSessionEnded(int row, const QString& reason);
+
 private:
     void setState(ConnectionState s);
     void setError(const QString& msg);
@@ -169,6 +176,10 @@ private:
     void sendHello();
     void sendComponentLifecycle(int row, const QString& type);
     void handleConfigFrame(const QString& type, const QJsonObject& body);
+    // Central handler for ``bad_op_signature`` — clears cached operator
+    // key, flips operatorAuthenticated to false, sets a user-friendly
+    // lastError. Idempotent.
+    void handleOperatorRejected();
 
     struct PendingConfigOp {
         int row;
