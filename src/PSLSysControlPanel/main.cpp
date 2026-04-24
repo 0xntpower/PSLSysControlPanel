@@ -20,13 +20,16 @@ int main(int argc, char* argv[])
     parser.setApplicationDescription(
         "PSLSysControlPanel\n\n"
         "Connects to one or more PSLAgent hosts over Tailscale.\n"
+        "Defaults to the PolySignalLab fleet (workstation + node2) when no\n"
+        "--host is given; pass --host to override.\n"
         "Single host:  --host workstation --port 19733\n"
         "Multi host:   --host workstation=10.0.0.1:19733 --host node2=10.0.0.2:19733");
     parser.addHelpOption();
     QCommandLineOption hostOpt(
         QStringList() << "host",
         "Agent host as a bare hostname, ``host:port``, or ``name=host:port``. "
-        "Pass multiple times to show several hosts in one panel.",
+        "Pass multiple times to show several hosts in one panel. If omitted, "
+        "the panel connects to the hardcoded workstation + node2 Tailscale IPs.",
         "host");
     QCommandLineOption portOpt(
         QStringList() << "port",
@@ -48,7 +51,11 @@ int main(int argc, char* argv[])
         static_cast<quint16>(parser.value(portOpt).toUInt());
     QStringList host_values = parser.values(hostOpt);
     if (host_values.isEmpty()) {
-        host_values << QStringLiteral("127.0.0.1");
+        // Tailscale IPs are static by design, so hardcoding the fleet here
+        // means a double-click launch Just Works. Override with --host when
+        // adding a new machine or running against a staging agent.
+        host_values << QStringLiteral("workstation=100.100.100.100:19733")
+                    << QStringLiteral("node2=127.0.0.1:19733");
     }
 
     pslcp::net::HostManager host_manager;
