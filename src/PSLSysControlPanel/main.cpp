@@ -4,9 +4,8 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 
-#include "ComponentModel.hpp"
-#include "net/AgentClient.hpp"
 #include "net/Credentials.hpp"
+#include "net/HostManager.hpp"
 #include "net/OperatorAuth.hpp"
 
 int main(int argc, char* argv[])
@@ -18,15 +17,20 @@ int main(int argc, char* argv[])
     app.setApplicationDisplayName("PSL System Control Panel");
 
     QCommandLineParser parser;
-    parser.setApplicationDescription("PSLSysControlPanel");
+    parser.setApplicationDescription(
+        "PSLSysControlPanel\n\n"
+        "Connects to one or more PSLAgent hosts over Tailscale.\n"
+        "Single host:  --host workstation --port 19733\n"
+        "Multi host:   --host workstation=10.0.0.1:19733 --host node2=10.0.0.2:19733");
     parser.addHelpOption();
     QCommandLineOption hostOpt(
         QStringList() << "host",
-        "Agent host or Tailscale hostname (default: 127.0.0.1)",
-        "host", "127.0.0.1");
+        "Agent host as a bare hostname, ``host:port``, or ``name=host:port``. "
+        "Pass multiple times to show several hosts in one panel.",
+        "host");
     QCommandLineOption portOpt(
         QStringList() << "port",
-        "Agent TCP port (default: 19733)",
+        "Default agent TCP port (applied to --host values that omit one).",
         "port", "19733");
     QCommandLineOption offlineOpt(
         QStringList() << "offline",
@@ -36,32 +40,39 @@ int main(int argc, char* argv[])
     parser.addOption(offlineOpt);
     parser.process(app);
 
-    // Initialize libsodium up-front so any failure shows at startup, not
-    // later when the operator tries to authenticate.
     if (!pslcp::net::ensureSodium()) {
         qWarning() << "libsodium failed to initialize — operator auth will be disabled";
     }
 
-    pslcp::ComponentModel componentModel;
-    pslcp::net::AgentClient agentClient;
+    const quint16 default_port =
+        static_cast<quint16>(parser.value(portOpt).toUInt());
+    QStringList host_values = parser.values(hostOpt);
+    if (host_values.isEmpty()) {
+        host_values << QStringLiteral("127.0.0.1");
+    }
 
-    if (!parser.isSet(offlineOpt)) {
+    pslcp::net::HostManager host_manager;
+
+    if (parser.isSet(offlineOpt)) {
+        host_manager.addOfflineSession(QStringLiteral("offline"));
+    } else {
         const auto cred = pslcp::net::loadManagerPsk();
         if (!cred.ok) {
-            qWarning().noquote() << "MANAGER_PSK unavailable:" << cred.error_message
-                                 << " — falling back to mock data. Use --offline to silence this.";
+            qWarning().noquote()
+                << "MANAGER_PSK unavailable:" << cred.error_message
+                << " — falling back to mock data. Use --offline to silence this.";
+            host_manager.addOfflineSession(QStringLiteral("mock"));
         } else {
-            agentClient.configure(parser.value(hostOpt),
-                                  static_cast<quint16>(parser.value(portOpt).toUInt()),
-                                  cred.key_bytes);
-            componentModel.attachAgent(&agentClient);
-            agentClient.start();
+            for (const QString& raw : host_values) {
+                const auto spec = pslcp::net::HostManager::parseSpec(raw, default_port);
+                host_manager.addSession(spec, cred.key_bytes);
+            }
+            host_manager.startAll();
         }
     }
 
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty("componentModel", &componentModel);
-    engine.rootContext()->setContextProperty("agentClient", &agentClient);
+    engine.rootContext()->setContextProperty("hostManager", &host_manager);
     engine.load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
     if (engine.rootObjects().isEmpty()) {
         return -1;

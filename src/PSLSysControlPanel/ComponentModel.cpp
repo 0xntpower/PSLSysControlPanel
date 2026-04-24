@@ -103,7 +103,8 @@ void ComponentModel::SyncFromAgent()
             r.uptimeSec = std::max<qint64>(0, now - ci.started_at);
         }
         r.eventsPerSec = 0.0;
-        r.cpuPct = 0.0;
+        r.cpuPct = (ci.cpu_pct < 0.0) ? 0.0 : ci.cpu_pct;
+        r.rssMb = ci.rss_mb;
         r.queueDepth = 0;
         rows_.append(std::move(r));
     }
@@ -140,6 +141,7 @@ QVariant ComponentModel::data(const QModelIndex& index, int role) const
         case UptimeTextRole: return FormatUptime(r.uptimeSec);
         case EventsRole:     return r.eventsPerSec;
         case CpuRole:        return r.cpuPct;
+        case RssRole:        return r.rssMb;
         case QueueRole:      return r.queueDepth;
         default:             return {};
     }
@@ -156,6 +158,7 @@ QHash<int, QByteArray> ComponentModel::roleNames() const
         {UptimeTextRole, "uptimeText"},
         {EventsRole,     "eventsPerSec"},
         {CpuRole,        "cpuPct"},
+        {RssRole,        "rssMb"},
         {QueueRole,      "queueDepth"},
     };
 }
@@ -242,6 +245,7 @@ QVariantMap ComponentModel::snapshotFor(int row) const
     m.insert("uptimeText",   FormatUptime(r.uptimeSec));
     m.insert("eventsPerSec", r.eventsPerSec);
     m.insert("cpuPct",       r.cpuPct);
+    m.insert("rssMb",        r.rssMb);
     m.insert("queueDepth",   r.queueDepth);
     return m;
 }

@@ -56,6 +56,10 @@ public:
         int pid = 0;
         qint64 started_at = 0;
         QString telemetry_endpoint;
+        // -1.0 means "not reported" — agent sends null for non-live states
+        // or when psutil couldn't read the process (denied / already reaped).
+        double cpu_pct = -1.0;
+        double rss_mb = -1.0;
     };
 
     explicit AgentClient(QObject* parent = nullptr);

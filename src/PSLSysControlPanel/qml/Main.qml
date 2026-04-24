@@ -49,6 +49,20 @@ ApplicationWindow {
     property int selectedIndex: 0
     property int tickSignal: 0  // bumps each data refresh to force chart redraw
     property string overlay: ""  // "" | "config" | "logs"
+
+    // Reactive aliases for the active session. Switching hosts replaces
+    // hostManager.currentClient/currentModel, which these bindings track,
+    // so every inner reference to agentClient/componentModel updates in
+    // lockstep without touching the context.
+    readonly property var agentClient: hostManager.currentClient
+    readonly property var componentModel: hostManager.currentModel
+
+    // Reset the row selection when the active host changes — the previous
+    // host's component list probably doesn't map to the new one.
+    Connections {
+        target: hostManager
+        function onCurrentIndexChanged() { root.selectedIndex = 0 }
+    }
     Timer {
         interval: 1000; running: true; repeat: true
         onTriggered: tickSignal = tickSignal + 1
@@ -136,10 +150,133 @@ ApplicationWindow {
         }
     }
 
+    // ---------- Connection-state strip ----------
+    // Visible only when the agent is not in the Ready state. Takes zero
+    // height when hidden so the body layout isn't disturbed.
+    Rectangle {
+        id: connStrip
+        anchors.top: headerBar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        readonly property int stateCode: agentClient.connectionState
+        readonly property bool shown: stateCode !== 3
+        height: shown ? 26 : 0
+        visible: shown
+        color: {
+            switch (stateCode) {
+                case 0: return "#2a1a1a";  // disconnected — dim red
+                case 4: return "#3a1d1d";  // failed — more red
+                case 1:
+                case 2: return "#1f2a3a";  // connecting/handshaking — dim blue
+            }
+            return theme.bgSurface;
+        }
+        Rectangle {
+            anchors.bottom: parent.bottom; width: parent.width; height: 1; color: theme.border
+        }
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 16
+            anchors.rightMargin: 16
+            spacing: 10
+            Rectangle {
+                width: 7; height: 7; radius: 3.5
+                color: {
+                    switch (connStrip.stateCode) {
+                        case 1:
+                        case 2: return theme.warning;
+                        case 4: return theme.danger;
+                    }
+                    return theme.textMuted;
+                }
+            }
+            Text {
+                text: {
+                    switch (connStrip.stateCode) {
+                        case 0: return "Disconnected — reconnecting…";
+                        case 1: return "Connecting to " + agentClient.agentHostId + "…";
+                        case 2: return "Handshaking…";
+                        case 4: return "Connection failed: " + agentClient.lastError + " (retrying)";
+                    }
+                    return "";
+                }
+                color: theme.textPrimary
+                font.pixelSize: 11
+                font.family: "Consolas"
+            }
+            Item { Layout.fillWidth: true }
+        }
+    }
+
+    // ---------- Host-selector strip ----------
+    // Visible only when more than one host session is configured. Renders
+    // the host names as tabs; clicking swaps hostManager.currentIndex.
+    Rectangle {
+        id: hostStrip
+        anchors.top: connStrip.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        readonly property bool shown: hostManager.count > 1
+        height: shown ? 34 : 0
+        visible: shown
+        color: theme.bgSurface
+        Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: theme.border }
+
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: 14
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 4
+
+            Text {
+                text: "HOSTS"
+                anchors.verticalCenter: parent.verticalCenter
+                color: theme.textMuted
+                font.pixelSize: 10
+                font.letterSpacing: 1.8
+                font.weight: Font.DemiBold
+                rightPadding: 12
+            }
+
+            Repeater {
+                model: hostManager.hostNames
+                delegate: Rectangle {
+                    required property int index
+                    required property string modelData
+                    readonly property bool active: index === hostManager.currentIndex
+                    width: tabLabel.implicitWidth + 22
+                    height: 24
+                    anchors.verticalCenter: parent.verticalCenter
+                    radius: 4
+                    color: active ? theme.bgSelected
+                                  : (tabArea.containsMouse ? theme.bgHover : "transparent")
+                    border.color: active ? theme.accentDim : theme.border
+                    border.width: 1
+                    Text {
+                        id: tabLabel
+                        anchors.centerIn: parent
+                        text: modelData
+                        color: active ? theme.textPrimary : theme.textMuted
+                        font.pixelSize: 11
+                        font.family: "Consolas"
+                        font.weight: active ? Font.DemiBold : Font.Normal
+                    }
+                    MouseArea {
+                        id: tabArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: hostManager.currentIndex = index
+                    }
+                }
+            }
+        }
+    }
+
     // ---------- Body: Sidebar + Detail ----------
     Rectangle {
         id: body
-        anchors.top: headerBar.bottom
+        anchors.top: hostStrip.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: footerBar.top
@@ -329,6 +466,7 @@ ApplicationWindow {
             readonly property string cUptimeText: snap.uptimeText ?? "—"
             readonly property real   cEvents:     snap.eventsPerSec ?? 0
             readonly property real   cCpu:        snap.cpuPct     ?? 0
+            readonly property real   cRss:        snap.rssMb      ?? -1
             readonly property int    cQueue:      snap.queueDepth ?? 0
 
             ColumnLayout {
@@ -515,6 +653,14 @@ ApplicationWindow {
                         label: "CPU"
                         value: detail.cStatus === 0 ? "—" : detail.cCpu.toFixed(1) + "%"
                         valueColor: detail.cCpu > 70 ? theme.warning : theme.textPrimary
+                    }
+                    MetricCard {
+                        Layout.fillWidth: true
+                        label: "RSS"
+                        value: (detail.cStatus === 0 || detail.cRss < 0)
+                               ? "—"
+                               : detail.cRss.toFixed(1) + " MB"
+                        valueColor: theme.textPrimary
                     }
                     MetricCard {
                         Layout.fillWidth: true
@@ -724,6 +870,82 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ---------- Error toast ----------
+    // Pops at the bottom-right whenever agentClient.lastError changes to a
+    // non-empty string. Auto-dismisses after 5s; click to dismiss early.
+    Rectangle {
+        id: errorToast
+        anchors.right: parent.right
+        anchors.bottom: footerBar.top
+        anchors.rightMargin: 18
+        anchors.bottomMargin: 18
+        width: Math.min(440, parent.width - 36)
+        height: Math.max(44, toastText.implicitHeight + 22)
+        radius: 8
+        color: "#3a1d1d"
+        border.color: theme.danger
+        border.width: 1
+        z: 300
+        visible: opacity > 0.01
+        opacity: 0
+        property string message: ""
+        Behavior on opacity { NumberAnimation { duration: 160 } }
+
+        Timer {
+            id: toastHide
+            interval: 5000
+            onTriggered: errorToast.opacity = 0
+        }
+
+        function show(msg) {
+            if (!msg) return;
+            errorToast.message = msg;
+            errorToast.opacity = 1;
+            toastHide.restart();
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 10
+            Rectangle { width: 8; height: 8; radius: 4; color: theme.danger }
+            Text {
+                id: toastText
+                Layout.fillWidth: true
+                text: errorToast.message
+                color: theme.textPrimary
+                font.pixelSize: 11
+                font.family: "Consolas"
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                text: "×"
+                color: theme.textMuted
+                font.pixelSize: 18
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: errorToast.opacity = 0
+                }
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: errorToast.opacity = 0
+            z: -1
+        }
+    }
+
+    Connections {
+        target: agentClient
+        function onLastErrorChanged() {
+            if (agentClient.lastError !== "") {
+                errorToast.show(agentClient.lastError);
             }
         }
     }

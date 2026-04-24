@@ -597,6 +597,10 @@ void AgentClient::handleFrame(const QByteArray& frame_body)
             const QJsonValue started = o.value(QStringLiteral("started_at"));
             ci.started_at = started.isNull() ? 0 : static_cast<qint64>(started.toDouble());
             ci.telemetry_endpoint = o.value(QStringLiteral("telemetry_endpoint")).toString();
+            const QJsonValue cpu = o.value(QStringLiteral("cpu_pct"));
+            ci.cpu_pct = cpu.isNull() ? -1.0 : cpu.toDouble();
+            const QJsonValue rss = o.value(QStringLiteral("rss_mb"));
+            ci.rss_mb = rss.isNull() ? -1.0 : rss.toDouble();
             components_.append(ci);
         }
         emit componentListUpdated();

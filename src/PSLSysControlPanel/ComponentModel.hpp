@@ -30,6 +30,7 @@ struct ComponentRow {
     qint64 uptimeSec = 0;
     double eventsPerSec = 0.0;
     double cpuPct = 0.0;
+    double rssMb = -1.0;   // -1.0 means "not reported"
     int queueDepth = 0;
     double phase = 0.0;
     double baseline = 0.0;
@@ -49,6 +50,7 @@ public:
         UptimeTextRole,
         EventsRole,
         CpuRole,
+        RssRole,
         QueueRole
     };
 
