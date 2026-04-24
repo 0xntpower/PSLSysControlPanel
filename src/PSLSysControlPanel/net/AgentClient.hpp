@@ -60,6 +60,9 @@ public:
         // or when psutil couldn't read the process (denied / already reaped).
         double cpu_pct = -1.0;
         double rss_mb = -1.0;
+        // Log files declared in the manifest for this component — lets the
+        // panel pre-populate the LOGS path without a second round-trip.
+        QStringList log_files;
     };
 
     explicit AgentClient(QObject* parent = nullptr);
@@ -107,8 +110,13 @@ public:
     // the main connection is request/response, tailing takes over its own
     // session). ``filter_pattern`` is optional; when empty the stream is
     // byte-oriented, otherwise line-matches only.
+    // ``historyBytes`` (default 0) lets the panel pre-load the tail end of
+    // the existing file so the overlay isn't empty until the component
+    // writes something new. 0 → start at EOF. Positive → probe file size
+    // and begin tail at ``max(0, size - historyBytes)``.
     Q_INVOKABLE void startLogTail(int row, const QString& path,
-                                  const QString& filterPattern);
+                                  const QString& filterPattern,
+                                  qint64 historyBytes = 0);
     Q_INVOKABLE void stopLogTail();
 
     ConnectionState connectionState() const;

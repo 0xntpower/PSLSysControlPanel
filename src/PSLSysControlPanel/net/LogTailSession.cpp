@@ -3,7 +3,9 @@
 #include "Envelope.hpp"
 
 #include <QByteArray>
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QTcpSocket>
 
 namespace pslcp::net {
@@ -11,6 +13,7 @@ namespace pslcp::net {
 LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator_key,
                                int row, const QString& component_id,
                                const QString& path, const QString& filter_pattern,
+                               qint64 history_bytes,
                                QObject* parent)
     : QObject(parent)
     , psk_(psk)
@@ -19,8 +22,11 @@ LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator
     , component_id_(component_id)
     , path_(path)
     , filter_pattern_(filter_pattern)
+    , history_bytes_(history_bytes)
     , socket_(new QTcpSocket(this))
     , hello_done_(false)
+    , probe_sent_(false)
+    , tail_sent_(false)
     , ended_emitted_(false)
 {
     connect(socket_, &QTcpSocket::connected, this, &LogTailSession::onConnected);
@@ -86,7 +92,30 @@ void LogTailSession::onReadyRead()
         const QString t = r.payload.type;
         if (t == QStringLiteral("agent_hello.ok") && !hello_done_) {
             hello_done_ = true;
-            sendTailRequest();
+            if (history_bytes_ > 0) {
+                // Probe the file size first; actual log_tail is deferred
+                // until the probe response lands so we can back up by
+                // ``history_bytes_`` from the current end.
+                sendFilesProbe();
+            } else {
+                sendTailRequest(-1);  // -1 = omit from_offset, tail from EOF
+                emit started(row_, path_);
+            }
+        } else if (t == QStringLiteral("log_files.ok") && probe_sent_ && !tail_sent_) {
+            const QJsonArray files =
+                r.payload.body.value(QStringLiteral("files")).toArray();
+            qint64 file_size = 0;
+            for (const QJsonValue& v : files) {
+                const QJsonObject f = v.toObject();
+                if (f.value(QStringLiteral("path")).toString() == path_) {
+                    file_size =
+                        static_cast<qint64>(f.value(QStringLiteral("size")).toDouble());
+                    break;
+                }
+            }
+            const qint64 from_offset =
+                (file_size > history_bytes_) ? (file_size - history_bytes_) : 0;
+            sendTailRequest(from_offset);
             emit started(row_, path_);
         } else if (t == QStringLiteral("log_tail.push")) {
             if (r.payload.body.contains(QStringLiteral("line_no"))) {
@@ -130,7 +159,21 @@ void LogTailSession::onDisconnected()
     }
 }
 
-void LogTailSession::sendTailRequest()
+void LogTailSession::sendFilesProbe()
+{
+    QJsonObject args;
+    args.insert(QStringLiteral("id"), component_id_);
+    QJsonObject inner;
+    inner.insert(QStringLiteral("type"), QStringLiteral("log_files"));
+    inner.insert(QStringLiteral("req_id"), QStringLiteral("tail-files"));
+    inner.insert(QStringLiteral("timestamp"), QString::fromUtf8(nowIso()));
+    inner.insert(QStringLiteral("args"), args);
+    // log_files is operator-gated server-side.
+    socket_->write(encodeSignedFrame(psk_, inner, operator_key_));
+    probe_sent_ = true;
+}
+
+void LogTailSession::sendTailRequest(qint64 from_offset)
 {
     QJsonObject args;
     args.insert(QStringLiteral("id"), component_id_);
@@ -138,12 +181,17 @@ void LogTailSession::sendTailRequest()
     if (!filter_pattern_.isEmpty()) {
         args.insert(QStringLiteral("filter_pattern"), filter_pattern_);
     }
+    if (from_offset >= 0) {
+        args.insert(QStringLiteral("from_offset"),
+                    static_cast<double>(from_offset));
+    }
     QJsonObject inner;
     inner.insert(QStringLiteral("type"), QStringLiteral("log_tail"));
     inner.insert(QStringLiteral("req_id"), QStringLiteral("tail-req"));
     inner.insert(QStringLiteral("timestamp"), QString::fromUtf8(nowIso()));
     inner.insert(QStringLiteral("args"), args);
     socket_->write(encodeSignedFrame(psk_, inner, operator_key_));
+    tail_sent_ = true;
 }
 
 } // namespace pslcp::net

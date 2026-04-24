@@ -445,7 +445,8 @@ private:
 #endif
 
 void AgentClient::startLogTail(int row, const QString& path,
-                                const QString& filterPattern)
+                                const QString& filterPattern,
+                                qint64 historyBytes)
 {
     if (state_ != Ready || operator_key_.isEmpty()) {
         emit logTailEnded(row, QStringLiteral("agent not ready / operator not authenticated"));
@@ -457,7 +458,8 @@ void AgentClient::startLogTail(int row, const QString& path,
     }
     stopLogTail();  // only one session at a time in v0
     log_tail_session_ = new LogTailSession(
-        psk_, operator_key_, row, components_.at(row).id, path, filterPattern, this);
+        psk_, operator_key_, row, components_.at(row).id, path, filterPattern,
+        historyBytes, this);
     connect(log_tail_session_, &LogTailSession::started,
             this, &AgentClient::logTailStarted);
     connect(log_tail_session_, &LogTailSession::line,
@@ -601,6 +603,10 @@ void AgentClient::handleFrame(const QByteArray& frame_body)
             ci.cpu_pct = cpu.isNull() ? -1.0 : cpu.toDouble();
             const QJsonValue rss = o.value(QStringLiteral("rss_mb"));
             ci.rss_mb = rss.isNull() ? -1.0 : rss.toDouble();
+            const QJsonArray lf_arr = o.value(QStringLiteral("log_files")).toArray();
+            for (const QJsonValue& lf : lf_arr) {
+                ci.log_files.append(lf.toString());
+            }
             components_.append(ci);
         }
         emit componentListUpdated();

@@ -106,6 +106,7 @@ void ComponentModel::SyncFromAgent()
         r.cpuPct = (ci.cpu_pct < 0.0) ? 0.0 : ci.cpu_pct;
         r.rssMb = ci.rss_mb;
         r.queueDepth = 0;
+        r.logFiles = ci.log_files;
         rows_.append(std::move(r));
     }
     endResetModel();
@@ -143,6 +144,7 @@ QVariant ComponentModel::data(const QModelIndex& index, int role) const
         case CpuRole:        return r.cpuPct;
         case RssRole:        return r.rssMb;
         case QueueRole:      return r.queueDepth;
+        case LogFilesRole:   return r.logFiles;
         default:             return {};
     }
 }
@@ -160,6 +162,7 @@ QHash<int, QByteArray> ComponentModel::roleNames() const
         {CpuRole,        "cpuPct"},
         {RssRole,        "rssMb"},
         {QueueRole,      "queueDepth"},
+        {LogFilesRole,   "logFiles"},
     };
 }
 
@@ -247,6 +250,7 @@ QVariantMap ComponentModel::snapshotFor(int row) const
     m.insert("cpuPct",       r.cpuPct);
     m.insert("rssMb",        r.rssMb);
     m.insert("queueDepth",   r.queueDepth);
+    m.insert("logFiles",     r.logFiles);
     return m;
 }
 

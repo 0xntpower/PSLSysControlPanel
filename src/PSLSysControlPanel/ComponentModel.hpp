@@ -36,6 +36,7 @@ struct ComponentRow {
     double baseline = 0.0;
     QList<QPointF> history;
     QStringList recentLogs;
+    QStringList logFiles;  // paths tailable via the agent
 };
 
 class ComponentModel : public QAbstractListModel {
@@ -51,7 +52,8 @@ public:
         EventsRole,
         CpuRole,
         RssRole,
-        QueueRole
+        QueueRole,
+        LogFilesRole
     };
 
     explicit ComponentModel(QObject* parent = nullptr);

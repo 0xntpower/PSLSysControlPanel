@@ -16,9 +16,16 @@ namespace pslcp::net {
 class LogTailSession : public QObject {
     Q_OBJECT
 public:
+    // ``history_bytes`` > 0 primes the stream with the tail of the existing
+    // file: the session sends a ``log_files`` probe to learn the current
+    // size, then starts ``log_tail`` with ``from_offset = size -
+    // history_bytes`` (clamped at 0). 0 means "start at EOF" (tail only
+    // new writes). Clients that want an initial context chunk should pass
+    // e.g. 64 KiB for the overlay or ~4 KiB for the detail-pane mirror.
     LogTailSession(const QByteArray& psk, const QByteArray& operator_key,
                    int row, const QString& component_id,
                    const QString& path, const QString& filter_pattern,
+                   qint64 history_bytes,
                    QObject* parent = nullptr);
 
     // Connect to ``host:port`` and drive the handshake. Emits either
@@ -44,7 +51,8 @@ private slots:
     void onDisconnected();
 
 private:
-    void sendTailRequest();
+    void sendFilesProbe();
+    void sendTailRequest(qint64 from_offset);
 
     QByteArray psk_;
     QByteArray operator_key_;
@@ -52,9 +60,12 @@ private:
     QString component_id_;
     QString path_;
     QString filter_pattern_;
+    qint64 history_bytes_;
     QTcpSocket* socket_;
     QByteArray recv_buffer_;
     bool hello_done_;
+    bool probe_sent_;
+    bool tail_sent_;
     bool ended_emitted_;
 };
 

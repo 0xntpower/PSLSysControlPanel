@@ -53,9 +53,13 @@ ApplicationWindow {
     // Reactive aliases for the active session. Switching hosts replaces
     // hostManager.currentClient/currentModel, which these bindings track,
     // so every inner reference to agentClient/componentModel updates in
-    // lockstep without touching the context.
-    readonly property var agentClient: hostManager.currentClient
-    readonly property var componentModel: hostManager.currentModel
+    // lockstep without touching the context. Typed as QtObject (not var)
+    // because Connections { target: agentClient } needs a plain QObject* —
+    // a var-wrapped one wouldn't hook signal subscriptions (method calls
+    // through JS dispatch still work, which is why startComponent etc.
+    // worked while Connections did not).
+    readonly property QtObject agentClient: hostManager.currentClient
+    readonly property QtObject componentModel: hostManager.currentModel
 
     // Reset the row selection when the active host changes — the previous
     // host's component list probably doesn't map to the new one.
@@ -66,6 +70,54 @@ ApplicationWindow {
     Timer {
         interval: 1000; running: true; repeat: true
         onTriggered: tickSignal = tickSignal + 1
+    }
+
+    // ---- mini-log auto-tail arbitration ----
+    // The mini "recent logs" strip wants a live tail running whenever
+    // possible, but the dedicated LOGS overlay takes priority when open
+    // (only one log_tail session per AgentClient today). Here's the
+    // coordination:
+    //   * Overlay START — ``startLogTail`` in the overlay button kills
+    //     whatever session is active and opens a new one with 64 KiB of
+    //     history. The mini's Connections receives onLogTailEnded for the
+    //     old session and schedules a retry via ``miniRetry``.
+    //   * Overlay STOP / close — tail ends; retry fires after 500 ms and,
+    //     since logsOverlay.streaming is now false, the mini starts its
+    //     own 4 KiB-history session for the current row's primary log.
+    //   * Row change — everything stops and clears; the mini re-arms for
+    //     the newly selected row once its log_files are known.
+    property bool miniTailActive: false
+
+    function primaryLogFileFor(row) {
+        if (!componentModel || row < 0) return "";
+        var snap = componentModel.snapshotFor(row);
+        if (!snap || !snap.logFiles || snap.logFiles.length === 0) return "";
+        return snap.logFiles[0];
+    }
+
+    function ensureMiniTail() {
+        if (logsOverlay.streaming) return;
+        if (!agentClient || agentClient.connectionState !== 3) return;
+        if (!agentClient.operatorAuthenticated) return;
+        if (miniTailActive) return;
+        var path = primaryLogFileFor(root.selectedIndex);
+        if (!path) return;
+        agentClient.startLogTail(root.selectedIndex, path, "", 4096);
+        miniTailActive = true;
+    }
+
+    Timer {
+        id: miniRetry
+        interval: 500
+        repeat: false
+        onTriggered: ensureMiniTail()
+    }
+
+    Connections {
+        target: agentClient
+        function onConnectionStateChanged() { miniRetry.restart(); }
+        function onOperatorAuthenticatedChanged() { miniRetry.restart(); }
+        function onComponentListUpdated() { miniRetry.restart(); }
     }
 
     // ---------- Header ----------
@@ -468,6 +520,7 @@ ApplicationWindow {
             readonly property real   cCpu:        snap.cpuPct     ?? 0
             readonly property real   cRss:        snap.rssMb      ?? -1
             readonly property int    cQueue:      snap.queueDepth ?? 0
+            readonly property var    cLogFiles:   snap.logFiles   ?? []
 
             ColumnLayout {
                 anchors.fill: parent
@@ -802,13 +855,80 @@ ApplicationWindow {
                         }
                     }
 
-                    // Logs panel
+                    // Logs panel — mirrors the active LOGS-overlay tail with
+                    // a smaller line budget. Same wire-level source as the
+                    // overlay; both are driven by the single AgentClient log-
+                    // tail session. Cleared on row change and at the start of
+                    // every new tail so what's visible is always the current
+                    // component's fresh stream, never a stale snapshot.
                     Rectangle {
                         Layout.preferredWidth: 420
                         Layout.fillHeight: true
                         radius: 10
                         color: theme.bgSurface
                         border.color: theme.border; border.width: 1
+
+                        property int miniMaxLines: 40
+                        ListModel { id: miniLogModel }
+
+                        // Row change: stop whichever tail is active, close
+                        // the overlay if it was open for the previous row,
+                        // clear both models, and let the retry timer re-arm
+                        // the mini for the new row once its log_files land.
+                        Connections {
+                            target: root
+                            function onSelectedIndexChanged() {
+                                if (agentClient) agentClient.stopLogTail();
+                                root.miniTailActive = false;
+                                miniLogModel.clear();
+                                tailModel.clear();
+                                logsOverlay.streaming = false;
+                                if (root.overlay === "logs") root.overlay = "";
+                                miniRetry.restart();
+                            }
+                        }
+
+                        // The mini-log and the overlay both listen to the
+                        // same AgentClient signals — writes are independent,
+                        // each has its own ListModel with its own cap.
+                        Connections {
+                            target: hostManager.currentClient
+                            function onLogTailStarted(row, path) {
+                                if (row !== root.selectedIndex) return;
+                                miniLogModel.clear();
+                            }
+                            function onLogTailLine(row, lineNo, text) {
+                                if (row !== root.selectedIndex) return;
+                                miniLogModel.append({text: lineNo + "  " + text});
+                                while (miniLogModel.count > miniMaxLines)
+                                    miniLogModel.remove(0);
+                                miniLogList.positionViewAtEnd();
+                            }
+                            function onLogTailBytes(row, offset, data) {
+                                if (row !== root.selectedIndex) return;
+                                var s = data;
+                                if (typeof data === "object") {
+                                    try { s = new TextDecoder().decode(data); }
+                                    catch (e) { s = "" + data; }
+                                }
+                                var lines = String(s).split(/\r?\n/);
+                                for (var i = 0; i < lines.length; ++i) {
+                                    if (lines[i].length > 0)
+                                        miniLogModel.append({text: lines[i]});
+                                }
+                                while (miniLogModel.count > miniMaxLines)
+                                    miniLogModel.remove(0);
+                                miniLogList.positionViewAtEnd();
+                            }
+                            function onLogTailEnded(row, reason) {
+                                // Flag the mini slot as free regardless of
+                                // which consumer owned the ended session —
+                                // the retry timer will re-take it if the
+                                // overlay isn't streaming.
+                                root.miniTailActive = false;
+                                miniRetry.restart();
+                            }
+                        }
 
                         ColumnLayout {
                             anchors.fill: parent
@@ -825,41 +945,55 @@ ApplicationWindow {
                                 }
                                 Item { Layout.fillWidth: true }
                                 Text {
-                                    text: "tail · live"
-                                    color: theme.textDim
+                                    text: logsOverlay.streaming
+                                          ? "tail · live"
+                                          : "press LOGS to tail"
+                                    color: logsOverlay.streaming
+                                           ? theme.success
+                                           : theme.textDim
                                     font.pixelSize: 10
                                 }
                             }
 
                             ListView {
-                                id: logList
+                                id: miniLogList
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 clip: true
-                                model: []
+                                model: miniLogModel
                                 boundsBehavior: Flickable.StopAtBounds
                                 spacing: 2
-                                verticalLayoutDirection: ListView.TopToBottom
-
-                                Connections {
-                                    target: root
-                                    function onTickSignal() {
-                                        logList.model = componentModel.logsFor(root.selectedIndex);
-                                        logList.positionViewAtEnd();
-                                    }
-                                    function onSelectedIndexChanged() {
-                                        logList.model = componentModel.logsFor(root.selectedIndex);
-                                        logList.positionViewAtEnd();
-                                    }
+                                // Stick to the bottom as new lines arrive,
+                                // unless the operator has scrolled up.
+                                property bool stickToBottom: true
+                                onContentYChanged: {
+                                    if (!moving && !flicking) return;
+                                    stickToBottom = atYEnd;
                                 }
-                                Component.onCompleted: model = componentModel.logsFor(root.selectedIndex)
+                                onCountChanged: {
+                                    if (stickToBottom) Qt.callLater(positionViewAtEnd);
+                                }
 
                                 delegate: Text {
-                                    required property string modelData
-                                    width: logList.width
-                                    text: modelData
-                                    color: modelData.indexOf("WARN") >= 0 ? theme.warning
-                                         : modelData.indexOf("ERROR") >= 0 ? theme.danger
+                                    width: miniLogList.width
+                                    // Compact the noisy prefix so the message
+                                    // itself gets most of the column.
+                                    // ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL  ] module.path: msg``
+                                    // becomes ``HH:MM:SS [LEVEL] msg``. Falls
+                                    // back to the raw line if it doesn't match
+                                    // (e.g. lines from a non-Python component
+                                    // or continuation lines from multi-line
+                                    // stack traces).
+                                    text: {
+                                        var s = model.text;
+                                        var re = /^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
+                                        var m = s.match(re);
+                                        return m ? (m[1] + " [" + m[2] + "] " + m[3]) : s;
+                                    }
+                                    color: text.indexOf("WARN") >= 0
+                                               ? theme.warning
+                                         : text.indexOf("ERROR") >= 0
+                                               ? theme.danger
                                          : theme.textMuted
                                     font.pixelSize: 11
                                     font.family: "Consolas"
@@ -942,7 +1076,7 @@ ApplicationWindow {
     }
 
     Connections {
-        target: agentClient
+        target: hostManager.currentClient
         function onLastErrorChanged() {
             if (agentClient.lastError !== "") {
                 errorToast.show(agentClient.lastError);
@@ -1124,7 +1258,7 @@ ApplicationWindow {
         property color statusColor: theme.textMuted
 
         Connections {
-            target: agentClient
+            target: hostManager.currentClient
             function onConfigFilesListed(row, paths) {
                 if (row !== root.selectedIndex) return;
                 fileModel.clear();
@@ -1289,7 +1423,7 @@ ApplicationWindow {
         ListModel { id: tailModel }
 
         Connections {
-            target: agentClient
+            target: hostManager.currentClient
             function onLogTailStarted(row, path) {
                 if (row !== root.selectedIndex) return;
                 logsOverlay.streaming = true;
@@ -1305,10 +1439,12 @@ ApplicationWindow {
             }
             function onLogTailBytes(row, offset, data) {
                 if (row !== root.selectedIndex) return;
-                // bytes arrive raw; split on newlines for display.
                 var text = data;
-                if (typeof data === "object") text = new TextDecoder().decode(data);
-                var lines = String(text).split("\n");
+                if (typeof data === "object") {
+                    try { text = new TextDecoder().decode(data); }
+                    catch (e) { text = "" + data; }
+                }
+                var lines = String(text).split(/\r?\n/);
                 for (var i = 0; i < lines.length; ++i) {
                     if (lines[i].length > 0) tailModel.append({text: lines[i]});
                 }
@@ -1379,12 +1515,28 @@ ApplicationWindow {
                     spacing: 10
                     TextField {
                         id: pathField
-                        Layout.preferredWidth: 240
+                        Layout.preferredWidth: 260
+                        // Pre-fill with the selected component's first log
+                        // file; the operator can still override to tail a
+                        // secondary log. Refreshed whenever the overlay
+                        // becomes visible so stale rows don't persist.
+                        text: primaryLogFileFor(root.selectedIndex)
                         placeholderText: "log path (from manifest)"
                         color: theme.textPrimary
                         background: Rectangle {
                             color: theme.bgElevated
                             border.color: theme.border; border.width: 1; radius: 4
+                        }
+                        Connections {
+                            target: root
+                            function onOverlayChanged() {
+                                if (root.overlay === "logs") {
+                                    pathField.text = primaryLogFileFor(root.selectedIndex);
+                                }
+                            }
+                            function onSelectedIndexChanged() {
+                                pathField.text = primaryLogFileFor(root.selectedIndex);
+                            }
                         }
                     }
                     TextField {
@@ -1398,16 +1550,22 @@ ApplicationWindow {
                         }
                     }
                     ActionButton {
-                        label: logsOverlay.streaming ? "STOP" : "START"
-                        accent: logsOverlay.streaming ? theme.danger : theme.success
-                        enabledReal: logsOverlay.streaming || pathField.text.length > 0
+                        // The mini-log keeps a 4 KiB-history tail running in
+                        // the background whenever possible, so the overlay
+                        // opens with recent data already visible. Clicking
+                        // this button requests a bigger (64 KiB) reload —
+                        // useful when you want to scroll back through more
+                        // context than the mini-log holds.
+                        implicitWidth: 150
+                        label: "RELOAD"
+                        accent: theme.success
+                        enabledReal: pathField.text.length > 0
                         onClicked: {
-                            if (logsOverlay.streaming) {
-                                agentClient.stopLogTail();
-                            } else {
-                                agentClient.startLogTail(
-                                    root.selectedIndex, pathField.text, filterField.text);
-                            }
+                            agentClient.startLogTail(
+                                root.selectedIndex,
+                                pathField.text,
+                                filterField.text,
+                                65536);
                         }
                     }
                 }
@@ -1427,13 +1585,30 @@ ApplicationWindow {
                         model: tailModel
                         clip: true
                         boundsBehavior: Flickable.StopAtBounds
+                        // Stick to the bottom whenever a new line arrives —
+                        // unless the operator has scrolled up to read
+                        // history, in which case we leave them alone.
+                        // ``atYEnd`` is only accurate after layout, so
+                        // ``Qt.callLater`` defers the scroll to the next
+                        // event-loop tick.
+                        property bool stickToBottom: true
+                        onContentYChanged: {
+                            if (!moving && !flicking) return;
+                            stickToBottom = atYEnd;
+                        }
+                        onCountChanged: {
+                            if (stickToBottom) Qt.callLater(positionViewAtEnd);
+                        }
                         delegate: Text {
-                            required property string text
+                            // Direct model-role access avoids the Text.text /
+                            // required-property-named-text collision entirely.
+                            // ListModel rows added as {text: "..."} expose
+                            // the value via ``model.text`` in the delegate.
                             width: tailList.width
-                            text: parent.text
+                            text: model.text
                             color: theme.textPrimary
                             font.family: "Consolas"
-                            font.pixelSize: 11
+                            font.pixelSize: 12
                             wrapMode: Text.NoWrap
                             elide: Text.ElideRight
                         }
