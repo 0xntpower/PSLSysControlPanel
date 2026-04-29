@@ -138,9 +138,14 @@ copy /Y "$(VcpkgInstalled)\bin\libsodium.dll" "$(OutDir)"</Command>
   <ItemGroup>
     <QtRcc Include="qml.qrc" />
   </ItemGroup>
+  <!-- Win32 resource script: embeds app.ico as the EXE icon. -->
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
   <!-- QML files (shown in solution explorer; embedded via qml.qrc) -->
   <ItemGroup>
     <None Include="qml\Main.qml" />
+    <None Include="app.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Condition="Exists('$(QtMsBuild)\qt.targets')">

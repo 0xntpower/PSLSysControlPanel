@@ -1,0 +1,4 @@
+// Embeds the application icon into the EXE so Explorer / taskbar pickers
+// can show it before Qt has loaded. IDI_ICON1 (lowest numeric ID) is what
+// Windows uses as the executable icon by convention.
+IDI_ICON1 ICON "app.ico"

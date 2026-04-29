@@ -15,6 +15,7 @@ int main(int argc, char* argv[])
     app.setOrganizationDomain("polysignallab.local");
     app.setApplicationName("PSL System Control Panel");
     app.setApplicationDisplayName("PSL System Control Panel");
+    app.setWindowIcon(QIcon(QStringLiteral(":/app.ico")));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(

@@ -28,5 +28,9 @@
     <None Include="qml\Main.qml">
       <Filter>qml</Filter>
     </None>
+    <None Include="app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
   </ItemGroup>
 </Project>
