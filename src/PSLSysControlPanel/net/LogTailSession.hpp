@@ -16,16 +16,28 @@ namespace pslcp::net {
 class LogTailSession : public QObject {
     Q_OBJECT
 public:
-    // ``history_bytes`` > 0 primes the stream with the tail of the existing
-    // file: the session sends a ``log_files`` probe to learn the current
-    // size, then starts ``log_tail`` with ``from_offset = size -
-    // history_bytes`` (clamped at 0). 0 means "start at EOF" (tail only
-    // new writes). Clients that want an initial context chunk should pass
-    // e.g. 64 KiB for the overlay or ~4 KiB for the detail-pane mirror.
+    // Two history-priming modes, in priority order:
+    //
+    //   * ``from_offset >= 0`` — explicit byte position. The session
+    //     still sends a ``log_files`` probe to detect rotation: if the
+    //     current ``file_size`` is at least ``from_offset``, the tail
+    //     starts at ``from_offset`` exactly; if it's smaller (file was
+    //     rotated and is now shorter than our cached high-water mark),
+    //     the tail starts at 0 instead. Used by the mini-log to resume
+    //     where it left off on a row switch without re-streaming the
+    //     entire file.
+    //
+    //   * ``history_bytes > 0`` (only consulted when ``from_offset < 0``)
+    //     — relative-to-end mode: probe ``log_files`` to learn ``file_size``,
+    //     then start tail at ``max(0, file_size - history_bytes)``. Used
+    //     for "fetch the entire current file" with a sentinel like
+    //     ``MAX_SAFE_INTEGER``.
+    //
+    //   * Both 0/-1 — start at EOF (tail only new writes).
     LogTailSession(const QByteArray& psk, const QByteArray& operator_key,
                    int row, const QString& component_id,
                    const QString& path, const QString& filter_pattern,
-                   qint64 history_bytes,
+                   qint64 history_bytes, qint64 from_offset,
                    QObject* parent = nullptr);
 
     // Connect to ``host:port`` and drive the handshake. Emits either
@@ -61,6 +73,7 @@ private:
     QString path_;
     QString filter_pattern_;
     qint64 history_bytes_;
+    qint64 from_offset_;
     QTcpSocket* socket_;
     QByteArray recv_buffer_;
     bool hello_done_;

@@ -46,6 +46,139 @@ ApplicationWindow {
         }
     }
 
+    // ---------- Event parser ----------
+    // Filters the live log stream down to "major events" per component.
+    // Reads the same line stream that drives the mini-log and the LOGS
+    // overlay (no new networking). Each component has its own regex
+    // table; first match wins. Unmatched lines are dropped.
+    //
+    // Each rule yields { kind, summary }. ``kind`` indexes into kindMeta
+    // for color + display label. ``summary`` is the rendered body —
+    // short, structured, not the raw log line.
+    QtObject {
+        id: eventParser
+
+        // Visual metadata for each event kind. Keep labels ≤ 10 chars so
+        // the badge column stays narrow and the summary column gets the
+        // remaining width without truncation.
+        readonly property var kindMeta: ({
+            "signal_swap":     { label: "SIGNAL",   color: theme.accent  },
+            "bet_placed":      { label: "BET",      color: theme.accent  },
+            "fill":            { label: "FILL",     color: theme.starting },
+            "early_exit":      { label: "EXIT",     color: theme.warning },
+            "win":             { label: "WIN",      color: theme.success },
+            "loss":            { label: "LOSS",     color: theme.danger  },
+            "breaker_open":    { label: "BREAKER",  color: theme.danger  },
+            "breaker_recover": { label: "BREAKER",  color: theme.success },
+            "risk_halt":       { label: "RISK",     color: theme.danger  },
+            "bankroll_drift":  { label: "BANKROLL", color: theme.warning },
+            "midnight_reset":  { label: "RESET",    color: theme.textMuted },
+            "delivered":       { label: "SENT",     color: theme.success },
+            "no_signal":       { label: "NO-SEND",  color: theme.warning },
+            "engine_run":      { label: "ENGINE",   color: theme.textMuted },
+            "cycle":           { label: "CYCLE",    color: theme.textMuted },
+            "new_window":      { label: "WINDOW",   color: theme.accent  },
+            "tokens":          { label: "TOKENS",   color: theme.starting },
+            "promoted":        { label: "RESOLVED", color: theme.success },
+            "archived":        { label: "ARCHIVE",  color: theme.textMuted },
+        })
+
+        // Per-component rule tables. Each rule: { re, kind, fmt }.
+        // ``fmt`` is a function (match-array → summary string).
+        // Order matters — earlier rules win.
+        readonly property var rules: ({
+            "PolyTraderLightning": [
+                { re: /SIGNAL_SWAP_ACTIVE:\s*(.+)$/,
+                  kind: "signal_swap",
+                  fmt: function(m) { return m[1]; } },
+                { re: /WINDOW_DECISION\s+\[WIN\]\s+rank=(\d+)\s+side=(\w+)\s+pnl=\$?(-?[\d.]+)\s+entry=([\d.]+)\s+size=\$?([\d.]+)/,
+                  kind: "win",
+                  fmt: function(m) { return "rank=" + m[1] + " " + m[2] + "  pnl=$" + m[3] + "  entry=" + m[4] + "  size=$" + m[5]; } },
+                { re: /WINDOW_DECISION\s+\[LOSS\]\s+rank=(\d+)\s+side=(\w+)\s+pnl=\$?(-?[\d.]+)\s+entry=([\d.]+)\s+size=\$?([\d.]+)/,
+                  kind: "loss",
+                  fmt: function(m) { return "rank=" + m[1] + " " + m[2] + "  pnl=$" + m[3] + "  entry=" + m[4] + "  size=$" + m[5]; } },
+                { re: /(\w+)\s+(maker|taker)\s+order placed:\s*id=(\w+)\s+price=([\d.]+)\s+size=([\d.]+)/,
+                  kind: "bet_placed",
+                  fmt: function(m) { return m[2].toUpperCase() + "  " + m[1] + "  price=" + m[4] + "  shares=" + m[5] + "  id=" + m[3]; } },
+                { re: /LIVE FILL DETECTED:\s*order=(\w+)\s+token=(\w+)\s+price=([\d.]+)\s+size=([\d.]+)\s+usd=\$?([\d.]+)\s+confirmed=(\w+)/,
+                  kind: "fill",
+                  fmt: function(m) { return "price=" + m[3] + "  size=" + m[4] + "  $" + m[5] + "  confirmed=" + m[6] + "  id=" + m[1]; } },
+                { re: /live early-exit resolution:\s*window=(\d+)\s+side=(\w+)\s+sell=([\d.]+)/,
+                  kind: "early_exit",
+                  fmt: function(m) { return "window=" + m[1] + "  " + m[2] + "  sell=" + m[3]; } },
+                { re: /circuit breaker \[([^\]]+)\]:\s*\w+\s*->\s*OPEN\s+after\s+(\d+)\s+failures.*?cooldown=([\d.]+)/,
+                  kind: "breaker_open",
+                  fmt: function(m) { return m[1] + "  → OPEN  failures=" + m[2] + "  cooldown=" + m[3] + "s"; } },
+                { re: /circuit breaker \[([^\]]+)\]:\s*\w+\s*→\s*CLOSED/,
+                  kind: "breaker_recover",
+                  fmt: function(m) { return m[1] + "  → CLOSED"; } },
+                { re: /risk halted:\s*(.+?)\s+—/,
+                  kind: "risk_halt",
+                  fmt: function(m) { return m[1]; } },
+                { re: /BANKROLL_STARTUP_DRIFT\s+(.+)$/,
+                  kind: "bankroll_drift",
+                  fmt: function(m) { return m[1]; } },
+                { re: /midnight UTC\b.*resetting risk counters/,
+                  kind: "midnight_reset",
+                  fmt: function(m) { return "session summary sent · counters reset"; } },
+            ],
+            "SignalOrchestrator": [
+                { re: /DELIVERING\s+(\w+)\s+signal:\s*(.+)$/,
+                  kind: "delivered",
+                  fmt: function(m) { return m[1] + "  " + m[2]; } },
+                { re: /no signal passed all delivery gates/,
+                  kind: "no_signal",
+                  fmt: function(m) { return "all candidates rejected — no fire this cycle"; } },
+                { re: /engine produced:\s*(\S+)/,
+                  kind: "engine_run",
+                  fmt: function(m) { return m[1]; } },
+                { re: /---\s*cycle start\s*\[([^\]]+)\]\s*---/,
+                  kind: "cycle",
+                  fmt: function(m) { return "cycle " + m[1]; } },
+            ],
+            "PolyDataCollector": [
+                { re: /New window:\s*(\S+)\s+\(([\d.]+)s remaining\)/,
+                  kind: "new_window",
+                  fmt: function(m) { return m[1] + "  (" + m[2] + "s remaining)"; } },
+                { re: /CLOB subscribed:\s*up=(\w+)\s+down=(\w+)/,
+                  kind: "tokens",
+                  fmt: function(m) { return "up=" + m[1] + "  down=" + m[2]; } },
+                { re: /promoted\s+(\S+)\s+->\s+(\S+)/,
+                  kind: "promoted",
+                  fmt: function(m) { return m[1] + " → " + m[2]; } },
+                { re: /archive: compressing\s+(\d+)\s+files\s*->\s*(\S+)/,
+                  kind: "archived",
+                  fmt: function(m) { return m[1] + " files → " + m[2]; } },
+                { re: /rolling pool: archived\s+(\S+)/,
+                  kind: "archived",
+                  fmt: function(m) { return m[1]; } },
+            ],
+        })
+
+        // ``parse`` strips an optional ``lineNo  `` prefix (the live-tail
+        // path prepends it; the bulk-reload path does not), then strips
+        // the ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL] module:`` header so
+        // regexes can anchor on the message body. Returns null on miss.
+        function parse(componentName, line) {
+            if (!line || !componentName) return null;
+            var componentRules = rules[componentName];
+            if (!componentRules) return null;
+            // Capture the wall-clock time so the row can render it.
+            var headerRe = /^(?:\d+\s+)?\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+\[\s*\w+\s*\]\s+[\w.]+:\s*(.*)$/;
+            var hm = line.match(headerRe);
+            var time = hm ? hm[1] : "";
+            var body = hm ? hm[2] : line;
+            for (var i = 0; i < componentRules.length; ++i) {
+                var rule = componentRules[i];
+                var m = body.match(rule.re);
+                if (m) {
+                    return { kind: rule.kind, time: time, summary: rule.fmt(m) };
+                }
+            }
+            return null;
+        }
+    }
+
     property int selectedIndex: 0
     property int tickSignal: 0  // bumps each data refresh to force chart redraw
     property string overlay: ""  // "" | "config" | "logs"
@@ -65,28 +198,58 @@ ApplicationWindow {
     // host's component list probably doesn't map to the new one.
     Connections {
         target: hostManager
-        function onCurrentIndexChanged() { root.selectedIndex = 0 }
+        function onCurrentIndexChanged() {
+            root.selectedIndex = 0;
+            // Different host = different agent, different files. Drop
+            // every buffered line — they belong to the previous host's
+            // view of the world. New tails will spin up via tailRetry
+            // once the new host's agent is Ready + authenticated.
+            dropAllBuffers();
+        }
     }
     Timer {
         interval: 1000; running: true; repeat: true
         onTriggered: tickSignal = tickSignal + 1
     }
 
-    // ---- mini-log auto-tail arbitration ----
-    // The mini "recent logs" strip wants a live tail running whenever
-    // possible, but the dedicated LOGS overlay takes priority when open
-    // (only one log_tail session per AgentClient today). Here's the
-    // coordination:
-    //   * Overlay START — ``startLogTail`` in the overlay button kills
-    //     whatever session is active and opens a new one with 64 KiB of
-    //     history. The mini's Connections receives onLogTailEnded for the
-    //     old session and schedules a retry via ``miniRetry``.
-    //   * Overlay STOP / close — tail ends; retry fires after 500 ms and,
-    //     since logsOverlay.streaming is now false, the mini starts its
-    //     own 4 KiB-history session for the current row's primary log.
-    //   * Row change — everything stops and clears; the mini re-arms for
-    //     the newly selected row once its log_files are known.
-    property bool miniTailActive: false
+    // ---- per-component log buffering (parallel tails) ----
+    // Architecture: while the agent is connected AND the operator is
+    // authenticated, the panel runs ONE log_tail session per component
+    // with declared log_files (see ``ensureAllTails``). Each session
+    // streams into a per-component buffer kept in
+    // ``componentBuffers[row]``. Switching the visible row is a pure
+    // view rebind — we copy the cached row's buffer into the
+    // mini-log TextEdit and the events ListModel — no network round-
+    // trip, no fetch, no clearing. Other components keep accumulating
+    // in the background while their row is hidden.
+    //
+    // Cache lifetime is tied to authenticated agent connection:
+    //   * Auth becomes true → start tails for every component with
+    //     log_files; allocate buffers.
+    //   * Auth or connection lost → stop all tails; drop buffers (the
+    //     user said: don't hold a cache for un-authenticated agents).
+    //   * Host change → buffers are dropped along with the agent.
+    //   * componentList refresh → diff against running tails; start
+    //     missing, stop ones whose components vanished.
+    //
+    // Each buffer:
+    //   {
+    //     compactText: string,    // mini-log rendered text (post-parse)
+    //     events: array,          // [{kind, time, summary}, ...]
+    //     lineCount: int,         // for FIFO cap
+    //     lastOffset: int,        // for resume on tail death
+    //     path: string,           // file being tailed
+    //     componentName: string,  // for the event parser dispatch
+    //   }
+    property var componentBuffers: ({})
+    // Per-row "is a tail session running for this row?" map. Used to
+    // make ``ensureAllTails`` idempotent so the periodic
+    // ``componentListUpdated`` poll doesn't tear down and re-create
+    // every session every few seconds. Cleared on disconnect / auth
+    // loss along with the buffers.
+    property var componentTailActive: ({})
+    readonly property int bufferMaxLines: 5000
+    readonly property int bufferMaxEvents: 50
 
     function primaryLogFileFor(row) {
         if (!componentModel || row < 0) return "";
@@ -95,29 +258,169 @@ ApplicationWindow {
         return snap.logFiles[0];
     }
 
-    function ensureMiniTail() {
-        if (logsOverlay.streaming) return;
+    function componentNameFor(row) {
+        if (!componentModel || row < 0) return "";
+        var snap = componentModel.snapshotFor(row);
+        return snap ? (snap.name || "") : "";
+    }
+
+    // Parse + transform a raw log line the same way the mini-log does
+    // for its compact display. Used to build the persistent buffer
+    // text so view rebinds match what's seen during live streaming.
+    function compactLogLine(line) {
+        if (!line) return "";
+        var re = /^(?:\d+\s+)?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
+        var m = line.match(re);
+        return m ? ("[" + m[1] + "] " + m[2]) : line;
+    }
+
+    function appendToBuffer(row, line) {
+        var buf = componentBuffers[row];
+        if (!buf) return;
+        if (!line) return;
+        var compact = compactLogLine(line);
+        // Maintain raw + compacted views in lock-step so a row switch
+        // can rebind whichever surface needs which view (LOGS overlay
+        // wants the raw line with timestamp/module; the mini-log wants
+        // the compact ``[LEVEL] msg`` form). Keeping them in step on
+        // the same line-count cap avoids one buffer drifting longer
+        // than the other after FIFO trimming.
+        if (buf.rawText.length > 0) {
+            buf.rawText += "\n" + line;
+        } else {
+            buf.rawText = line;
+        }
+        if (buf.compactText.length > 0) {
+            buf.compactText += "\n" + compact;
+        } else {
+            buf.compactText = compact;
+        }
+        buf.lineCount += 1;
+        while (buf.lineCount > bufferMaxLines) {
+            var nlc = buf.compactText.indexOf("\n");
+            var nlr = buf.rawText.indexOf("\n");
+            if (nlc < 0 && nlr < 0) break;
+            if (nlc >= 0) buf.compactText = buf.compactText.substring(nlc + 1);
+            if (nlr >= 0) buf.rawText = buf.rawText.substring(nlr + 1);
+            buf.lineCount -= 1;
+        }
+        // Try to recognize an event for the component-specific
+        // taxonomy (signal swap, bet placed, win/loss, etc.).
+        var ev = eventParser.parse(buf.componentName, line);
+        if (ev) {
+            buf.events.push(ev);
+            while (buf.events.length > bufferMaxEvents) buf.events.shift();
+        }
+    }
+
+    function ensureBuffer(row, path, componentName) {
+        if (!componentBuffers[row]) {
+            componentBuffers[row] = {
+                rawText: "",
+                compactText: "",
+                events: [],
+                lineCount: 0,
+                lastOffset: -1,
+                path: path,
+                componentName: componentName,
+            };
+        }
+        return componentBuffers[row];
+    }
+
+    function dropAllBuffers() {
+        componentBuffers = ({});
+        componentTailActive = ({});
+    }
+
+    // Force the visible widgets to show empty content. Used on auth /
+    // connection loss so the operator doesn't keep seeing the
+    // previous session's lines while disconnected.
+    function blankVisibleWidgets() {
+        if (typeof miniLogPane !== "undefined" && miniLogPane.miniLogClear) {
+            miniLogPane.miniLogClear();
+        }
+        if (typeof eventsModel !== "undefined") {
+            eventsModel.clear();
+        }
+        if (typeof logsOverlay !== "undefined" && logsOverlay.tailClear) {
+            logsOverlay.tailClear();
+            logsOverlay.streaming = false;
+        }
+    }
+
+    // Start (or resume) tails for every component with declared
+    // log_files. Idempotent — only opens a session for rows whose
+    // tail isn't already running (tracked in ``componentTailActive``).
+    // Skipped entirely when the agent isn't authenticated; the user
+    // explicitly does not want caches for un-authenticated components.
+    function ensureAllTails() {
         if (!agentClient || agentClient.connectionState !== 3) return;
         if (!agentClient.operatorAuthenticated) return;
-        if (miniTailActive) return;
-        var path = primaryLogFileFor(root.selectedIndex);
-        if (!path) return;
-        agentClient.startLogTail(root.selectedIndex, path, "", 4096);
-        miniTailActive = true;
+        if (!componentModel) return;
+        var n = componentModel.rowCount();
+        for (var row = 0; row < n; ++row) {
+            var path = primaryLogFileFor(row);
+            if (!path) continue;
+            var componentName = componentNameFor(row);
+            var buf = ensureBuffer(row, path, componentName);
+            // If the path changed (rare — manifest edit), reset the
+            // buffer for that component and force a full re-fetch.
+            if (buf.path !== path) {
+                buf.rawText = "";
+                buf.compactText = "";
+                buf.events = [];
+                buf.lineCount = 0;
+                buf.lastOffset = -1;
+                buf.path = path;
+                componentTailActive[row] = false;
+            }
+            if (componentTailActive[row]) continue;  // session live → skip
+            // Resume from where we left off if we have an offset; else
+            // request the entire current file.
+            var resume = (typeof buf.lastOffset === "number" && buf.lastOffset >= 0)
+                         ? buf.lastOffset
+                         : -1;
+            var historyArg = resume >= 0 ? 0 : Number.MAX_SAFE_INTEGER;
+            agentClient.startLogTail(row, path, "", historyArg, resume);
+            componentTailActive[row] = true;
+        }
     }
 
     Timer {
-        id: miniRetry
+        id: tailRetry
         interval: 500
         repeat: false
-        onTriggered: ensureMiniTail()
+        onTriggered: ensureAllTails()
     }
 
     Connections {
         target: agentClient
-        function onConnectionStateChanged() { miniRetry.restart(); }
-        function onOperatorAuthenticatedChanged() { miniRetry.restart(); }
-        function onComponentListUpdated() { miniRetry.restart(); }
+        function onConnectionStateChanged() {
+            // Lost connection → tear down everything. The C++ side
+            // already stops its sessions on socket teardown but the
+            // panel-side buffers and visible widgets must also drop
+            // so we don't render stale content for an un-authenticated
+            // agent.
+            if (!agentClient || agentClient.connectionState !== 3) {
+                dropAllBuffers();
+                blankVisibleWidgets();
+                return;
+            }
+            tailRetry.restart();
+        }
+        function onOperatorAuthenticatedChanged() {
+            // Auth lost → drop everything (per operator request:
+            // un-authenticated agents do not get a cache).
+            if (!agentClient || !agentClient.operatorAuthenticated) {
+                if (agentClient) agentClient.stopLogTail();
+                dropAllBuffers();
+                blankVisibleWidgets();
+                return;
+            }
+            tailRetry.restart();
+        }
+        function onComponentListUpdated() { tailRetry.restart(); }
     }
 
     // ---------- Header ----------
@@ -522,6 +825,48 @@ ApplicationWindow {
             readonly property int    cQueue:      snap.queueDepth ?? 0
             readonly property var    cLogFiles:   snap.logFiles   ?? []
 
+            // Filtered "major events" stream — populated from the same
+            // log-tail signals that drive the mini-log. See eventParser.
+            // ``eventsModel`` is the rendering surface for the currently-
+            // selected row only; the durable per-component history lives
+            // in ``componentBuffers[row].events`` and is rebound here on
+            // row switch via ``rebindEventsFromBuffer``.
+            ListModel { id: eventsModel }
+            readonly property int eventsMax: 50
+
+            function pushEvent(componentName, line) {
+                var ev = eventParser.parse(componentName, line);
+                if (!ev) return;
+                eventsModel.append(ev);
+                while (eventsModel.count > detail.eventsMax) {
+                    eventsModel.remove(0);
+                }
+            }
+
+            // Replace ``eventsModel`` contents with the selected row's
+            // buffered events. JS-array → ListModel copy is the cheapest
+            // path; ``eventsMax`` cap means we're copying ≤ 50 small
+            // objects, so this is microseconds even on a slow machine.
+            // After the rebind, snap the ListView to the bottom so the
+            // most recent events are visible by default. The per-append
+            // ``onCountChanged`` handler also fires positionViewAtEnd
+            // but the final call there can race ListView layout; an
+            // explicit Qt.callLater after the loop is the reliable
+            // path for "I just rebuilt the model, show the end".
+            function rebindEventsFromBuffer() {
+                eventsModel.clear();
+                var buf = componentBuffers[root.selectedIndex];
+                if (!buf || !buf.events) return;
+                for (var i = 0; i < buf.events.length; ++i) {
+                    eventsModel.append(buf.events[i]);
+                }
+                Qt.callLater(function() {
+                    if (typeof eventsList !== "undefined") {
+                        eventsList.positionViewAtEnd();
+                    }
+                });
+            }
+
             ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 22
@@ -697,8 +1042,11 @@ ApplicationWindow {
                     spacing: 12
                     MetricCard {
                         Layout.fillWidth: true
-                        label: "EVENTS / SEC"
-                        value: detail.cStatus === 0 ? "—" : detail.cEvents.toFixed(1)
+                        label: "EVENTS"
+                        // Live count of parsed major events in the buffer
+                        // (not raw log lines — only what the parser has
+                        // recognized as a "major event" per component).
+                        value: detail.cStatus === 0 ? "—" : eventsModel.count.toString()
                         valueColor: theme.accent
                     }
                     MetricCard {
@@ -749,7 +1097,7 @@ ApplicationWindow {
 
                             RowLayout {
                                 Text {
-                                    text: "EVENTS / SEC  ·  last 60s"
+                                    text: "EVENTS  ·  live"
                                     color: theme.textMuted
                                     font.pixelSize: 10
                                     font.letterSpacing: 1.6
@@ -757,99 +1105,139 @@ ApplicationWindow {
                                 }
                                 Item { Layout.fillWidth: true }
                                 Text {
-                                    text: detail.cStatus === 0 ? "—" : detail.cEvents.toFixed(1) + " now"
+                                    text: eventsModel.count + " in buffer"
                                     color: theme.accent
                                     font.pixelSize: 11
                                     font.family: "Consolas"
                                 }
                             }
 
-                            Canvas {
-                                id: chart
+                            // Filtered "major events" timeline. Driven by
+                            // the same log stream the mini-log consumes;
+                            // ``eventParser`` recognizes a per-component
+                            // catalogue of patterns (signal swap, bet
+                            // placed, fill, win/loss, breaker open, etc.)
+                            // and drops everything else. Each row renders
+                            // a colored kind-badge + monospace summary +
+                            // wall-clock time so an operator can scan the
+                            // session at a glance without parsing raw logs.
+                            ListView {
+                                id: eventsList
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                antialiasing: true
+                                clip: true
+                                model: eventsModel
+                                spacing: 4
+                                boundsBehavior: Flickable.StopAtBounds
+                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                                property var points: []
-                                property real yMax: 100
+                                // Auto-stick to the bottom whenever a new
+                                // event arrives so the latest row is the
+                                // one in view, without locking the user
+                                // out of scrolling back through history.
+                                onCountChanged: Qt.callLater(function() {
+                                    eventsList.positionViewAtEnd();
+                                })
 
-                                function refresh() {
-                                    var raw = componentModel.historyFor(root.selectedIndex);
-                                    var pts = [];
-                                    var maxY = 20;
-                                    for (var i = 0; i < raw.length; ++i) {
-                                        var p = raw[i];
-                                        pts.push({ x: p.x, y: p.y });
-                                        if (p.y > maxY) maxY = p.y;
+                                delegate: Rectangle {
+                                    width: ListView.view.width
+                                    height: 26
+                                    radius: 4
+                                    color: index % 2 === 0
+                                           ? theme.bgElevated
+                                           : Qt.rgba(0, 0, 0, 0)
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 8
+                                        anchors.rightMargin: 8
+                                        spacing: 10
+
+                                        // Kind badge: colored pill with a
+                                        // short uppercase label. Width is
+                                        // fixed so summaries align across
+                                        // rows even as kinds vary.
+                                        Rectangle {
+                                            implicitWidth: 78; implicitHeight: 18
+                                            radius: 3
+                                            color: "transparent"
+                                            border.width: 1
+                                            border.color: (eventParser.kindMeta[model.kind]
+                                                           ? eventParser.kindMeta[model.kind].color
+                                                           : theme.textDim)
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: (eventParser.kindMeta[model.kind]
+                                                       ? eventParser.kindMeta[model.kind].label
+                                                       : model.kind.toUpperCase())
+                                                color: (eventParser.kindMeta[model.kind]
+                                                        ? eventParser.kindMeta[model.kind].color
+                                                        : theme.textDim)
+                                                font.pixelSize: 9
+                                                font.letterSpacing: 1.0
+                                                font.weight: Font.Bold
+                                            }
+                                        }
+
+                                        // Selectable summary. TextEdit
+                                        // (read-only) gives the operator
+                                        // mouse + keyboard selection and
+                                        // copy without changing how the
+                                        // row looks. ``elide`` isn't
+                                        // available on TextEdit, so the
+                                        // surrounding RowLayout's
+                                        // ``Layout.fillWidth`` plus the
+                                        // delegate's clipping ListView
+                                        // do the truncation visually;
+                                        // the full text is still
+                                        // selectable via drag.
+                                        TextEdit {
+                                            Layout.fillWidth: true
+                                            text: model.summary
+                                            color: theme.textPrimary
+                                            selectedTextColor: theme.textPrimary
+                                            selectionColor: theme.accentDim
+                                            font.family: "Consolas"
+                                            font.pixelSize: 12
+                                            readOnly: true
+                                            selectByMouse: true
+                                            selectByKeyboard: true
+                                            wrapMode: TextEdit.NoWrap
+                                            // ``activeFocusOnPress`` so
+                                            // a click drags-selects
+                                            // instead of being eaten by
+                                            // the ListView's flick
+                                            // handler.
+                                            activeFocusOnPress: true
+                                        }
+
+                                        TextEdit {
+                                            text: model.time
+                                            color: theme.textDim
+                                            selectedTextColor: theme.textPrimary
+                                            selectionColor: theme.accentDim
+                                            font.family: "Consolas"
+                                            font.pixelSize: 10
+                                            readOnly: true
+                                            selectByMouse: true
+                                            selectByKeyboard: true
+                                            activeFocusOnPress: true
+                                        }
                                     }
-                                    chart.points = pts;
-                                    chart.yMax = maxY * 1.25 + 1;
-                                    chart.requestPaint();
                                 }
 
-                                Connections {
-                                    target: root
-                                    function onTickSignal() { chart.refresh(); }
-                                    function onSelectedIndexChanged() { chart.refresh(); }
-                                }
-                                Component.onCompleted: refresh()
-
-                                onPaint: {
-                                    var ctx = getContext("2d");
-                                    ctx.clearRect(0, 0, width, height);
-
-                                    // Grid
-                                    ctx.strokeStyle = theme.border;
-                                    ctx.lineWidth = 1;
-                                    ctx.beginPath();
-                                    for (var g = 1; g < 5; ++g) {
-                                        var y = (height / 5) * g;
-                                        ctx.moveTo(0, y);
-                                        ctx.lineTo(width, y);
-                                    }
-                                    ctx.stroke();
-
-                                    if (points.length < 2) return;
-
-                                    var xMin = points[0].x;
-                                    var xMax = points[points.length - 1].x;
-                                    var xSpan = Math.max(1, xMax - xMin);
-                                    var yMaxLocal = yMax;
-
-                                    function sx(p) { return ((p.x - xMin) / xSpan) * width; }
-                                    function sy(p) { return height - (p.y / yMaxLocal) * height; }
-
-                                    // Area fill under line
-                                    var grad = ctx.createLinearGradient(0, 0, 0, height);
-                                    grad.addColorStop(0, Qt.rgba(0, 0.85, 1.0, 0.28));
-                                    grad.addColorStop(1, Qt.rgba(0, 0.85, 1.0, 0.0));
-                                    ctx.fillStyle = grad;
-                                    ctx.beginPath();
-                                    ctx.moveTo(sx(points[0]), height);
-                                    for (var i = 0; i < points.length; ++i) {
-                                        ctx.lineTo(sx(points[i]), sy(points[i]));
-                                    }
-                                    ctx.lineTo(sx(points[points.length - 1]), height);
-                                    ctx.closePath();
-                                    ctx.fill();
-
-                                    // Line
-                                    ctx.strokeStyle = theme.accent;
-                                    ctx.lineWidth = 2;
-                                    ctx.lineJoin = "round";
-                                    ctx.beginPath();
-                                    ctx.moveTo(sx(points[0]), sy(points[0]));
-                                    for (var j = 1; j < points.length; ++j) {
-                                        ctx.lineTo(sx(points[j]), sy(points[j]));
-                                    }
-                                    ctx.stroke();
-
-                                    // Last point marker
-                                    var last = points[points.length - 1];
-                                    ctx.fillStyle = theme.accent;
-                                    ctx.beginPath();
-                                    ctx.arc(sx(last), sy(last), 3.5, 0, Math.PI * 2);
-                                    ctx.fill();
+                                // Empty-state placeholder. Visible until
+                                // the first event lands; helps operators
+                                // tell "no events yet" from "panel broken".
+                                Text {
+                                    anchors.centerIn: parent
+                                    visible: eventsModel.count === 0
+                                    text: detail.cStatus === 0
+                                          ? "component stopped — no events"
+                                          : "waiting for events…"
+                                    color: theme.textDim
+                                    font.pixelSize: 11
+                                    font.italic: true
                                 }
                             }
                         }
@@ -870,22 +1258,32 @@ ApplicationWindow {
                         border.color: theme.border; border.width: 1
 
                         // Selectable + horizontally-scrollable mini-log.
-                        // Backed by a TextArea so operators can highlight
-                        // and copy text; wrapped in a ScrollView so long
-                        // lines can be scrolled sideways. Cap and prefix-
-                        // compaction are done in JS before append.
-                        property int miniMaxLines: 40
+                        // Backed by a TextEdit so operators can highlight
+                        // and copy text; wrapped in a Flickable so long
+                        // lines can be scrolled sideways. The TextEdit
+                        // is just a rendering surface — durable state
+                        // lives in ``componentBuffers[row]`` and is
+                        // rebound here on row switch. Cap matches
+                        // ``bufferMaxLines`` so trim semantics are
+                        // consistent between buffer and view.
+                        property int miniMaxLines: bufferMaxLines
                         property int miniLineCount: 0
 
                         function miniAppend(line) {
                             if (!line) return;
-                            // Compact ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL  ]
-                            // module.path: msg`` → ``HH:MM:SS [LEVEL] msg``.
+                            // Compact ``[lineNo  ]YYYY-MM-DD HH:MM:SS.mmm
+                            // [LEVEL  ] module.path: msg`` → ``[LEVEL] msg``.
+                            // The optional ``lineNo  `` prefix handles the
+                            // live-tail path (onLogTailLine prepends it);
+                            // the bulk-reload path (onLogTailBytes) sends
+                            // raw lines that also match. Time prefix is
+                            // dropped — the mini-log is space-constrained
+                            // and timestamps push the message off-screen.
                             // Raw pass-through for non-matching lines so
                             // stack traces and foreign formats still show.
-                            var re = /^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
+                            var re = /^(?:\d+\s+)?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
                             var m = line.match(re);
-                            var out = m ? (m[1] + " [" + m[2] + "] " + m[3]) : line;
+                            var out = m ? ("[" + m[1] + "] " + m[2]) : line;
                             if (miniTextArea.length > 0) miniTextArea.append(out);
                             else miniTextArea.text = out;
                             miniLineCount += 1;
@@ -902,50 +1300,129 @@ ApplicationWindow {
                             miniLineCount = 0;
                         }
 
-                        // Row change: stop whichever tail is active, close
-                        // the overlay if it was open for the previous row,
-                        // clear both views, let the retry timer re-arm the
-                        // mini for the new row once its log_files land.
+                        // Replace the visible TextEdit content with the
+                        // currently-selected component's buffered text.
+                        // Cheap (one assignment) and renders instantly;
+                        // this is what makes row switching feel
+                        // immediate instead of "wait for tail to start".
+                        //
+                        // The cursorPosition assignment is a Qt 6
+                        // workaround: when ``text`` is set
+                        // programmatically, the TextEdit sometimes
+                        // doesn't lay out / paint until the widget is
+                        // interacted with — symptom is a blank view
+                        // that "fills in" only when the operator
+                        // clicks it. Setting cursorPosition triggers
+                        // ensureVisible which forces a layout pass and
+                        // a paint request synchronously, so the
+                        // content appears immediately on row switch.
+                        function rebindFromBuffer() {
+                            var buf = componentBuffers[root.selectedIndex];
+                            var t = (buf && typeof buf.compactText === "string")
+                                    ? buf.compactText
+                                    : "";
+                            miniTextArea.text = t;
+                            miniLineCount = (buf && buf.lineCount) || 0;
+                            miniTextArea.cursorPosition = miniTextArea.length;
+                            // Snap to bottom on rebind so the operator
+                            // sees the most recent lines first.
+                            Qt.callLater(function() {
+                                miniScroll.contentY = Math.max(
+                                    0,
+                                    miniScroll.contentHeight - miniScroll.height);
+                            });
+                        }
+
+                        // Row change: rebind the visible widgets to the
+                        // newly-selected row's buffer. No tails are
+                        // stopped, no fetch happens — every component
+                        // with declared log_files already has a tail
+                        // running and accumulating into its buffer.
+                        // This is what makes switching feel instant.
                         Connections {
                             target: root
                             function onSelectedIndexChanged() {
-                                if (agentClient) agentClient.stopLogTail();
-                                root.miniTailActive = false;
-                                miniLogPane.miniLogClear();
-                                logsOverlay.tailClear();
-                                logsOverlay.streaming = false;
+                                miniLogPane.rebindFromBuffer();
+                                detail.rebindEventsFromBuffer();
+                                logsOverlay.rebindFromBuffer();
                                 if (root.overlay === "logs") root.overlay = "";
-                                miniRetry.restart();
                             }
                         }
 
-                        // The mini-log and the overlay both listen to the
-                        // same AgentClient signals — writes are independent.
+                        // Live-stream subscriber. Signals carry ``row``
+                        // so we always route a chunk to the buffer for
+                        // the component that wrote it — even when the
+                        // operator is currently looking at a different
+                        // row. The visible widgets only mirror the
+                        // selected row to keep rendering cheap.
                         Connections {
                             target: hostManager.currentClient
                             function onLogTailStarted(row, path) {
-                                if (row !== root.selectedIndex) return;
-                                miniLogPane.miniLogClear();
+                                // Tail (re)started for this row. If we
+                                // were resuming, the buffer should keep
+                                // its content; if this is a fresh fetch
+                                // (e.g. RELOAD), the operator-initiated
+                                // restart already cleared things via
+                                // ``stopLogTailForRow``. Don't clear
+                                // here — that would erase content right
+                                // before the agent re-streams it.
                             }
                             function onLogTailLine(row, lineNo, text) {
-                                if (row !== root.selectedIndex) return;
-                                miniLogPane.miniAppend(lineNo + "  " + text);
+                                appendToBuffer(row, text);
+                                if (row === root.selectedIndex) {
+                                    miniLogPane.miniAppend(text);
+                                    detail.pushEvent(detail.cName, text);
+                                }
                             }
                             function onLogTailBytes(row, offset, data) {
-                                if (row !== root.selectedIndex) return;
+                                // Decode + book-keep the byte chunk
+                                // before fanning out. ``byteLength`` is
+                                // the right unit for ``lastOffset``
+                                // (matches the agent's notion of file
+                                // position) even when the rendered
+                                // string length differs.
                                 var s = data;
+                                var byteLen = 0;
                                 if (typeof data === "object") {
+                                    if (typeof data.byteLength === "number") {
+                                        byteLen = data.byteLength;
+                                    }
                                     try { s = new TextDecoder().decode(data); }
                                     catch (e) { s = "" + data; }
                                 }
+                                if (byteLen === 0 && typeof s === "string") {
+                                    byteLen = s.length;
+                                }
+                                var buf = componentBuffers[row];
+                                if (buf) {
+                                    var next = offset + byteLen;
+                                    if (typeof buf.lastOffset !== "number"
+                                        || next > buf.lastOffset) {
+                                        buf.lastOffset = next;
+                                    }
+                                }
                                 var lines = String(s).split(/\r?\n/);
+                                var isSelected = (row === root.selectedIndex);
                                 for (var i = 0; i < lines.length; ++i) {
-                                    if (lines[i].length > 0) miniLogPane.miniAppend(lines[i]);
+                                    if (lines[i].length === 0) continue;
+                                    appendToBuffer(row, lines[i]);
+                                    if (isSelected) {
+                                        miniLogPane.miniAppend(lines[i]);
+                                        detail.pushEvent(detail.cName, lines[i]);
+                                    }
                                 }
                             }
                             function onLogTailEnded(row, reason) {
-                                root.miniTailActive = false;
-                                miniRetry.restart();
+                                // The session for this row died (network
+                                // hiccup, file rotated, agent restart).
+                                // Mark the row as needing a new tail and
+                                // schedule a retry — ``ensureAllTails``
+                                // sees ``componentTailActive[row]`` is
+                                // false and resumes from ``buf.lastOffset``,
+                                // so the user doesn't see content gaps
+                                // when the new tail catches up.
+                                componentTailActive[row] = false;
+                                tailRetry.restart();
                             }
                         }
 
@@ -998,7 +1475,7 @@ ApplicationWindow {
                                     selectedTextColor: theme.textPrimary
                                     selectionColor: theme.accentDim
                                     font.family: "Consolas"
-                                    font.pixelSize: 11
+                                    font.pixelSize: 12
                                     onTextChanged: Qt.callLater(snapToEnd)
                                     function snapToEnd() {
                                         miniScroll.contentY = Math.max(
@@ -1451,18 +1928,44 @@ ApplicationWindow {
             lineCount = 0;
         }
 
+        // Repopulate the overlay's TextEdit from the selected row's
+        // RAW buffer (full timestamps + module names — the overlay is
+        // the "give me everything" view, distinct from the mini-log's
+        // compacted form). Snaps to the bottom on rebind. See the
+        // mini-log's ``rebindFromBuffer`` for the cursorPosition
+        // workaround that prevents the "blank until clicked" Qt 6
+        // TextEdit paint stall.
+        function rebindFromBuffer() {
+            var buf = componentBuffers[root.selectedIndex];
+            var t = (buf && typeof buf.rawText === "string") ? buf.rawText : "";
+            tailTextArea.text = t;
+            lineCount = (buf && buf.lineCount) || 0;
+            tailTextArea.cursorPosition = tailTextArea.length;
+            logsOverlay.streaming = !!agentClient
+                                    && agentClient.connectionState === 3
+                                    && agentClient.operatorAuthenticated;
+            logsOverlay.activePath = buf ? (buf.path || "") : "";
+            Qt.callLater(function() {
+                tailScroll.contentY = Math.max(
+                    0, tailScroll.contentHeight - tailScroll.height);
+            });
+        }
+
+        // Live mirror: when a tail event lands for the row the operator
+        // is currently viewing, append to the overlay's TextEdit too so
+        // the displayed view stays in sync with the buffer. Rows the
+        // operator isn't viewing don't render here — the buffer alone
+        // captures them, ready for an instant rebind on row switch.
         Connections {
             target: hostManager.currentClient
             function onLogTailStarted(row, path) {
                 if (row !== root.selectedIndex) return;
                 logsOverlay.streaming = true;
                 logsOverlay.activePath = path;
-                logsOverlay.tailClear();
-                logsOverlay.tailAppend("— streaming " + path + " —");
             }
             function onLogTailLine(row, lineNo, text) {
                 if (row !== root.selectedIndex) return;
-                logsOverlay.tailAppend(lineNo + "  " + text);
+                logsOverlay.tailAppend(text);
             }
             function onLogTailBytes(row, offset, data) {
                 if (row !== root.selectedIndex) return;
@@ -1477,8 +1980,20 @@ ApplicationWindow {
                 }
             }
             function onLogTailEnded(row, reason) {
+                if (row !== root.selectedIndex) return;
                 logsOverlay.streaming = false;
-                logsOverlay.tailAppend("— ended: " + reason + " —");
+            }
+        }
+
+        // When the overlay is opened, sync its TextEdit with whatever
+        // is already in the buffer for the current row instead of
+        // showing an empty view until the next live line arrives.
+        Connections {
+            target: root
+            function onOverlayChanged() {
+                if (root.overlay === "logs") {
+                    logsOverlay.rebindFromBuffer();
+                }
             }
         }
 
@@ -1532,7 +2047,12 @@ ApplicationWindow {
                         label: "CLOSE"
                         accent: theme.textDim
                         enabledReal: true
-                        onClicked: { agentClient.stopLogTail(); root.overlay = ""; }
+                        // Closing the overlay no longer stops the
+                        // background tail — the per-component tails
+                        // are persistent so the mini-log keeps showing
+                        // live data. The overlay is just a different
+                        // view onto the same buffer.
+                        onClicked: { root.overlay = ""; }
                     }
                 }
 
@@ -1575,22 +2095,43 @@ ApplicationWindow {
                         }
                     }
                     ActionButton {
-                        // The mini-log keeps a 4 KiB-history tail running in
-                        // the background whenever possible, so the overlay
-                        // opens with recent data already visible. Clicking
-                        // this button requests a bigger (64 KiB) reload —
-                        // useful when you want to scroll back through more
-                        // context than the mini-log holds.
+                        // RELOAD wipes the buffer for the current row
+                        // and restarts its tail with a full-file fetch,
+                        // applying whatever regex filter the operator
+                        // typed. Other rows' tails and buffers are
+                        // untouched (per-row session model). The
+                        // overlay rebinds to the cleared buffer first
+                        // so the user immediately sees the wipe rather
+                        // than stale content during the round-trip.
                         implicitWidth: 150
                         label: "RELOAD"
                         accent: theme.success
                         enabledReal: pathField.text.length > 0
                         onClicked: {
+                            var row = root.selectedIndex;
+                            var buf = componentBuffers[row];
+                            if (buf) {
+                                buf.rawText = "";
+                                buf.compactText = "";
+                                buf.events = [];
+                                buf.lineCount = 0;
+                                buf.lastOffset = -1;
+                            }
+                            logsOverlay.rebindFromBuffer();
+                            miniLogPane.rebindFromBuffer();
+                            detail.rebindEventsFromBuffer();
                             agentClient.startLogTail(
-                                root.selectedIndex,
+                                row,
                                 pathField.text,
                                 filterField.text,
-                                65536);
+                                Number.MAX_SAFE_INTEGER,
+                                -1);
+                            // Eagerly mark active so a concurrent
+                            // ``ensureAllTails`` (e.g. from a periodic
+                            // componentList poll) doesn't race us by
+                            // starting yet another session for the
+                            // same row.
+                            componentTailActive[row] = true;
                         }
                     }
                 }

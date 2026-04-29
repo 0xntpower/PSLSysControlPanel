@@ -13,7 +13,7 @@ namespace pslcp::net {
 LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator_key,
                                int row, const QString& component_id,
                                const QString& path, const QString& filter_pattern,
-                               qint64 history_bytes,
+                               qint64 history_bytes, qint64 from_offset,
                                QObject* parent)
     : QObject(parent)
     , psk_(psk)
@@ -23,6 +23,7 @@ LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator
     , path_(path)
     , filter_pattern_(filter_pattern)
     , history_bytes_(history_bytes)
+    , from_offset_(from_offset)
     , socket_(new QTcpSocket(this))
     , hello_done_(false)
     , probe_sent_(false)
@@ -92,10 +93,11 @@ void LogTailSession::onReadyRead()
         const QString t = r.payload.type;
         if (t == QStringLiteral("agent_hello.ok") && !hello_done_) {
             hello_done_ = true;
-            if (history_bytes_ > 0) {
+            if (from_offset_ >= 0 || history_bytes_ > 0) {
                 // Probe the file size first; actual log_tail is deferred
-                // until the probe response lands so we can back up by
-                // ``history_bytes_`` from the current end.
+                // until the probe response lands so we can choose between
+                // resume-at-cached-offset and back-up-from-end semantics
+                // (and detect rotation in the resume case).
                 sendFilesProbe();
             } else {
                 sendTailRequest(-1);  // -1 = omit from_offset, tail from EOF
@@ -113,9 +115,19 @@ void LogTailSession::onReadyRead()
                     break;
                 }
             }
-            const qint64 from_offset =
-                (file_size > history_bytes_) ? (file_size - history_bytes_) : 0;
-            sendTailRequest(from_offset);
+            qint64 resolved_from = 0;
+            if (from_offset_ >= 0) {
+                // Resume mode. Use the cached offset if the file is at
+                // least that big; otherwise the file was rotated (new
+                // session, archive cycle) and is now shorter than where
+                // we left off, so start over from the beginning.
+                resolved_from = (file_size >= from_offset_) ? from_offset_ : 0;
+            } else {
+                // Relative-to-end mode (history_bytes_).
+                resolved_from =
+                    (file_size > history_bytes_) ? (file_size - history_bytes_) : 0;
+            }
+            sendTailRequest(resolved_from);
             emit started(row_, path_);
         } else if (t == QStringLiteral("log_tail.push")) {
             if (r.payload.body.contains(QStringLiteral("line_no"))) {

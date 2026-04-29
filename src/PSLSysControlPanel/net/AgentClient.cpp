@@ -45,7 +45,6 @@ AgentClient::AgentClient(QObject* parent)
     , argon2_mem_kib_(0)
     , argon2_iters_(0)
     , argon2_threads_(0)
-    , log_tail_session_(nullptr)
 {
     connect(socket_, &QTcpSocket::connected, this, &AgentClient::onSocketConnected);
     connect(socket_, &QTcpSocket::readyRead, this, &AgentClient::onSocketReadyRead);
@@ -65,6 +64,13 @@ AgentClient::AgentClient(QObject* parent)
 
 AgentClient::~AgentClient()
 {
+    // Drop any tail sessions before closing the main socket. Each
+    // session owns its own socket, so shutdown order between them
+    // doesn't matter, but leaking them would leave QObject children
+    // attached to ``this`` and Qt would tear them down anyway —
+    // ``stopLogTail`` does it explicitly so socket abort/close is
+    // synchronous instead of via the deletion chain.
+    stopLogTail();
     socket_->abort();
 }
 
@@ -446,7 +452,7 @@ private:
 
 void AgentClient::startLogTail(int row, const QString& path,
                                 const QString& filterPattern,
-                                qint64 historyBytes)
+                                qint64 historyBytes, qint64 fromOffset)
 {
     if (state_ != Ready || operator_key_.isEmpty()) {
         emit logTailEnded(row, QStringLiteral("agent not ready / operator not authenticated"));
@@ -456,28 +462,50 @@ void AgentClient::startLogTail(int row, const QString& path,
         emit logTailEnded(row, QStringLiteral("bad row"));
         return;
     }
-    stopLogTail();  // only one session at a time in v0
-    log_tail_session_ = new LogTailSession(
+    // Replace any existing session for this row — used when RELOAD is
+    // hit with a new filter, or when an old session ended and the
+    // panel decided to restart it. Other rows' sessions are unaffected.
+    stopLogTailForRow(row);
+    auto* session = new LogTailSession(
         psk_, operator_key_, row, components_.at(row).id, path, filterPattern,
-        historyBytes, this);
-    connect(log_tail_session_, &LogTailSession::started,
+        historyBytes, fromOffset, this);
+    connect(session, &LogTailSession::started,
             this, &AgentClient::logTailStarted);
-    connect(log_tail_session_, &LogTailSession::line,
+    connect(session, &LogTailSession::line,
             this, &AgentClient::logTailLine);
-    connect(log_tail_session_, &LogTailSession::bytesChunk,
+    connect(session, &LogTailSession::bytesChunk,
             this, &AgentClient::logTailBytes);
-    connect(log_tail_session_, &LogTailSession::ended,
+    connect(session, &LogTailSession::ended,
             this, &AgentClient::onLogTailSessionEnded);
-    log_tail_session_->start(host_, port_);
+    log_tail_sessions_.insert(row, session);
+    session->start(host_, port_);
+}
+
+void AgentClient::stopLogTailForRow(int row)
+{
+    auto it = log_tail_sessions_.find(row);
+    if (it == log_tail_sessions_.end()) return;
+    LogTailSession* session = it.value();
+    log_tail_sessions_.erase(it);
+    if (session != nullptr) {
+        session->stop();
+        session->deleteLater();
+    }
 }
 
 void AgentClient::stopLogTail()
 {
-    if (log_tail_session_ != nullptr) {
-        log_tail_session_->stop();
-        log_tail_session_->deleteLater();
-        log_tail_session_ = nullptr;
+    // Tear down every running session. Used on disconnect / re-auth
+    // where the whole set has to go away.
+    const QList<int> rows = log_tail_sessions_.keys();
+    for (int row : rows) {
+        stopLogTailForRow(row);
     }
+}
+
+int AgentClient::activeLogTailCount() const
+{
+    return log_tail_sessions_.size();
 }
 
 void AgentClient::sendComponentLifecycle(int row, const QString& type)
@@ -691,6 +719,18 @@ void AgentClient::onLogTailSessionEnded(int row, const QString& reason)
 {
     if (reason.startsWith(QStringLiteral("bad_op_signature"))) {
         handleOperatorRejected();
+    }
+    // Reap the dead session from the hash so a future startLogTail for
+    // the same row creates a fresh one. The QTcpSocket may still be
+    // emitting tail signals during teardown; ``deleteLater`` defers the
+    // free until the event loop drains.
+    auto it = log_tail_sessions_.find(row);
+    if (it != log_tail_sessions_.end()) {
+        LogTailSession* session = it.value();
+        log_tail_sessions_.erase(it);
+        if (session != nullptr) {
+            session->deleteLater();
+        }
     }
     emit logTailEnded(row, reason);
 }

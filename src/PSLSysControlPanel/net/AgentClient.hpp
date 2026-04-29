@@ -12,6 +12,7 @@
 // reflect it in the header.
 
 #include <QByteArray>
+#include <QHash>
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
@@ -110,14 +111,33 @@ public:
     // the main connection is request/response, tailing takes over its own
     // session). ``filter_pattern`` is optional; when empty the stream is
     // byte-oriented, otherwise line-matches only.
-    // ``historyBytes`` (default 0) lets the panel pre-load the tail end of
-    // the existing file so the overlay isn't empty until the component
-    // writes something new. 0 → start at EOF. Positive → probe file size
-    // and begin tail at ``max(0, size - historyBytes)``.
+    //
+    // Two history-priming modes (priority order):
+    //
+    //   * ``fromOffset >= 0`` — explicit resume position. The session
+    //     probes file_size: if the file is at least that big, tail starts
+    //     at ``fromOffset`` exactly; if smaller (rotation), tail starts at
+    //     0. Used for "resume where I left off" on row switches.
+    //
+    //   * ``historyBytes > 0`` (only consulted when ``fromOffset < 0``) —
+    //     relative-to-end. Probes file_size, then tails from
+    //     ``max(0, size - historyBytes)``. Pass MAX_SAFE_INTEGER to fetch
+    //     the entire current file.
+    //
+    //   * Both 0/-1 → tail from EOF only.
     Q_INVOKABLE void startLogTail(int row, const QString& path,
                                   const QString& filterPattern,
-                                  qint64 historyBytes = 0);
+                                  qint64 historyBytes = 0,
+                                  qint64 fromOffset = -1);
+    // Stop the tail for one specific row. Used when restarting a tail
+    // (e.g. RELOAD) or when a component is no longer being tailed.
+    Q_INVOKABLE void stopLogTailForRow(int row);
+    // Stop every running tail. Used during disconnect / re-auth where
+    // all sessions have to be torn down at once.
     Q_INVOKABLE void stopLogTail();
+    // Number of currently-running tail sessions. QML uses this for
+    // diagnostics; not part of the protocol.
+    Q_INVOKABLE int activeLogTailCount() const;
 
     ConnectionState connectionState() const;
     QString lastError() const;
@@ -211,7 +231,13 @@ private:
     QByteArray operator_key_;   // 32 bytes when authenticated; empty otherwise
 
     QList<PendingConfigOp> pending_config_;
-    LogTailSession* log_tail_session_;
+    // One LogTailSession per row that's currently being tailed. The
+    // panel runs a tail for every component with log_files declared
+    // (while authenticated) so switching the visible row is a pure
+    // view rebind rather than a fetch. Lifetime: started by
+    // ``startLogTail(row, ...)``, removed in ``stopLogTailForRow(row)``
+    // or after the session emits ``ended``.
+    QHash<int, LogTailSession*> log_tail_sessions_;
 };
 
 } // namespace pslcp::net
