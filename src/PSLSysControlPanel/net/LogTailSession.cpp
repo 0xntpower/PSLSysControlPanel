@@ -7,8 +7,21 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QTcpSocket>
+#include <QTimer>
 
 namespace pslcp::net {
+
+namespace {
+
+constexpr int kMaxFrameBytesTail = 256 * 1024;
+// Tail streams are higher-volume than the main control connection — a
+// log_tail flood after a network stall can dump hundreds of push frames
+// at once. Same bounded-pump pattern as AgentClient: process this many
+// per call, then yield to the event loop so the GUI can paint.
+constexpr int kMaxFramesPerPumpTail = 32;
+constexpr int kRecvBufferCompactWatermarkTail = 64 * 1024;
+
+} // namespace
 
 LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator_key,
                                int row, const QString& component_id,
@@ -25,6 +38,8 @@ LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator
     , history_bytes_(history_bytes)
     , from_offset_(from_offset)
     , socket_(new QTcpSocket(this))
+    , pump_timer_(new QTimer(this))
+    , recv_consumed_(0)
     , hello_done_(false)
     , probe_sent_(false)
     , tail_sent_(false)
@@ -34,6 +49,10 @@ LogTailSession::LogTailSession(const QByteArray& psk, const QByteArray& operator
     connect(socket_, &QTcpSocket::readyRead, this, &LogTailSession::onReadyRead);
     connect(socket_, &QTcpSocket::errorOccurred, this, &LogTailSession::onError);
     connect(socket_, &QTcpSocket::disconnected, this, &LogTailSession::onDisconnected);
+
+    pump_timer_->setSingleShot(true);
+    pump_timer_->setInterval(0);
+    connect(pump_timer_, &QTimer::timeout, this, &LogTailSession::pumpFramesFromBuffer);
 }
 
 void LogTailSession::start(const QString& host, quint16 port)
@@ -43,6 +62,7 @@ void LogTailSession::start(const QString& host, quint16 port)
 
 void LogTailSession::stop()
 {
+    pump_timer_->stop();
     if (socket_->state() != QAbstractSocket::UnconnectedState) {
         socket_->abort();
     }
@@ -63,14 +83,23 @@ void LogTailSession::onConnected()
 void LogTailSession::onReadyRead()
 {
     recv_buffer_.append(socket_->readAll());
-    while (true) {
-        if (recv_buffer_.size() < 4) return;
+    pumpFramesFromBuffer();
+}
+
+void LogTailSession::pumpFramesFromBuffer()
+{
+    int processed = 0;
+    while (processed < kMaxFramesPerPumpTail) {
+        const int available = recv_buffer_.size() - recv_consumed_;
+        if (available < 4) break;
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(recv_buffer_.constData()) + recv_consumed_;
         const quint32 length =
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[0])) << 24) |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[1])) << 16) |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[2])) << 8) |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[3])));
-        if (length == 0 || length > 256 * 1024) {
+            (static_cast<quint32>(p[0]) << 24) |
+            (static_cast<quint32>(p[1]) << 16) |
+            (static_cast<quint32>(p[2]) << 8)  |
+            (static_cast<quint32>(p[3]));
+        if (length == 0 || length > kMaxFrameBytesTail) {
             if (!ended_emitted_) {
                 ended_emitted_ = true;
                 emit ended(row_, QStringLiteral("invalid frame length"));
@@ -78,9 +107,12 @@ void LogTailSession::onReadyRead()
             stop();
             return;
         }
-        if (static_cast<quint32>(recv_buffer_.size()) < 4 + length) return;
-        const QByteArray body = recv_buffer_.mid(4, static_cast<int>(length));
-        recv_buffer_.remove(0, 4 + static_cast<int>(length));
+        if (static_cast<quint32>(available) < 4 + length) break;
+        const QByteArray body =
+            QByteArray(recv_buffer_.constData() + recv_consumed_ + 4,
+                       static_cast<int>(length));
+        recv_consumed_ += 4 + static_cast<int>(length);
+        ++processed;
         const DecodeResult r = decodeAndVerify(body, psk_);
         if (!r.ok) {
             if (!ended_emitted_) {
@@ -159,6 +191,24 @@ void LogTailSession::onReadyRead()
             }
             stop();
             return;
+        }
+    }
+
+    if (recv_consumed_ >= kRecvBufferCompactWatermarkTail) {
+        recv_buffer_.remove(0, recv_consumed_);
+        recv_consumed_ = 0;
+    }
+
+    if (recv_buffer_.size() - recv_consumed_ >= 4) {
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(recv_buffer_.constData()) + recv_consumed_;
+        const quint32 next_len =
+            (static_cast<quint32>(p[0]) << 24) |
+            (static_cast<quint32>(p[1]) << 16) |
+            (static_cast<quint32>(p[2]) << 8)  |
+            (static_cast<quint32>(p[3]));
+        if (static_cast<quint32>(recv_buffer_.size() - recv_consumed_) >= 4 + next_len) {
+            pump_timer_->start();
         }
     }
 }

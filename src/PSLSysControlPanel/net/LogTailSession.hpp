@@ -10,6 +10,7 @@
 #include <QString>
 
 class QTcpSocket;
+class QTimer;
 
 namespace pslcp::net {
 
@@ -65,6 +66,10 @@ private slots:
 private:
     void sendFilesProbe();
     void sendTailRequest(qint64 from_offset);
+    // Drains complete frames from recv_buffer_ starting at recv_consumed_.
+    // Bounded per call; reschedules itself via pump_timer_ if more frames
+    // are buffered. See AgentClient::pumpFramesFromBuffer for rationale.
+    void pumpFramesFromBuffer();
 
     QByteArray psk_;
     QByteArray operator_key_;
@@ -75,7 +80,9 @@ private:
     qint64 history_bytes_;
     qint64 from_offset_;
     QTcpSocket* socket_;
+    QTimer* pump_timer_;
     QByteArray recv_buffer_;
+    int recv_consumed_;
     bool hello_done_;
     bool probe_sent_;
     bool tail_sent_;

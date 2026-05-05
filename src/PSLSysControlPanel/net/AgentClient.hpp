@@ -191,6 +191,13 @@ private:
     void setState(ConnectionState s);
     void setError(const QString& msg);
     void handleFrame(const QByteArray& frame_body);
+    // Drains complete frames out of recv_buffer_ starting at
+    // recv_consumed_. Bounded per call so a flood of buffered frames
+    // doesn't monopolize the GUI thread; if more remain, schedules
+    // pump_timer_ (0ms singleshot) so the event loop gets a paint
+    // chance between batches. Also compacts recv_buffer_ once the
+    // cursor crosses the high-water mark.
+    void pumpFramesFromBuffer();
     void sendRequest(const QString& type, const QJsonObject& args,
                      bool require_operator = false);
     void sendHello();
@@ -212,7 +219,20 @@ private:
     QTcpSocket* socket_;
     QTimer* reconnect_timer_;
     QTimer* refresh_timer_;  // periodic component_list poll while Ready
+    QTimer* pump_timer_;     // resumes onSocketReadyRead after yielding to event loop
     QByteArray recv_buffer_;
+    // Read-cursor into recv_buffer_. We advance this as frames are
+    // consumed instead of doing recv_buffer_.remove(0, n) each time —
+    // that was an O(n²) memmove storm under bursts of small frames.
+    // Compacted lazily once the cursor crosses a watermark.
+    int recv_consumed_;
+    // Backoff state for reconnect_timer_; doubles on each failed attempt
+    // and resets to the base delay once a Ready transition succeeds.
+    int reconnect_delay_ms_;
+    // Set to true while a component_list request is awaiting its reply,
+    // so the periodic refresh poll doesn't pile up requests when the
+    // network is slow.
+    bool component_list_in_flight_;
     ConnectionState state_;
     QString last_error_;
     QString host_id_;

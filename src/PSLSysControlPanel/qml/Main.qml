@@ -234,13 +234,20 @@ ApplicationWindow {
     //
     // Each buffer:
     //   {
-    //     compactText: string,    // mini-log rendered text (post-parse)
-    //     events: array,          // [{kind, time, summary}, ...]
-    //     lineCount: int,         // for FIFO cap
-    //     lastOffset: int,        // for resume on tail death
-    //     path: string,           // file being tailed
-    //     componentName: string,  // for the event parser dispatch
+    //     rawLines: array<string>,     // raw log lines, FIFO-capped
+    //     compactLines: array<string>, // post-parse "[LEVEL] msg" lines
+    //     events: array,               // [{kind, time, summary}, ...]
+    //     lastOffset: int,             // for resume on tail death
+    //     path: string,                // file being tailed
+    //     componentName: string,       // for the event parser dispatch
     //   }
+    //
+    // Lines are stored as arrays (not as += concatenated strings) so
+    // appends are O(1) instead of O(n²) — under a network-stall release
+    // burst the old scheme had to rebuild the whole buffer on every
+    // single line. Trim is bulk via splice() once the array grows past
+    // the soft cap, so the amortized append cost stays O(1). The
+    // visible text is materialized lazily in rebindFromBuffer via join().
     property var componentBuffers: ({})
     // Per-row "is a tail session running for this row?" map. Used to
     // make ``ensureAllTails`` idempotent so the periodic
@@ -250,6 +257,15 @@ ApplicationWindow {
     property var componentTailActive: ({})
     readonly property int bufferMaxLines: 5000
     readonly property int bufferMaxEvents: 50
+    // Initial history pulled when a tail starts fresh (no resume offset).
+    // Capped so a fresh connect over a high-latency link doesn't have to
+    // stream the entire current log file in base64 chunks before the UI
+    // can show anything. 256 KB is roughly 2-3 thousand lines of typical
+    // structured logging — plenty of context for the recent-logs view.
+    readonly property int initialTailHistoryBytes: 256 * 1024
+    // RELOAD button. The operator clicked it explicitly so they probably
+    // want more, but still capped to prevent multi-MB floods on slow links.
+    readonly property int reloadTailHistoryBytes: 1024 * 1024
 
     function primaryLogFileFor(row) {
         if (!componentModel || row < 0) return "";
@@ -278,31 +294,21 @@ ApplicationWindow {
         var buf = componentBuffers[row];
         if (!buf) return;
         if (!line) return;
-        var compact = compactLogLine(line);
-        // Maintain raw + compacted views in lock-step so a row switch
+        // Raw + compacted views are kept in lock-step so a row switch
         // can rebind whichever surface needs which view (LOGS overlay
         // wants the raw line with timestamp/module; the mini-log wants
-        // the compact ``[LEVEL] msg`` form). Keeping them in step on
-        // the same line-count cap avoids one buffer drifting longer
-        // than the other after FIFO trimming.
-        if (buf.rawText.length > 0) {
-            buf.rawText += "\n" + line;
-        } else {
-            buf.rawText = line;
-        }
-        if (buf.compactText.length > 0) {
-            buf.compactText += "\n" + compact;
-        } else {
-            buf.compactText = compact;
-        }
-        buf.lineCount += 1;
-        while (buf.lineCount > bufferMaxLines) {
-            var nlc = buf.compactText.indexOf("\n");
-            var nlr = buf.rawText.indexOf("\n");
-            if (nlc < 0 && nlr < 0) break;
-            if (nlc >= 0) buf.compactText = buf.compactText.substring(nlc + 1);
-            if (nlr >= 0) buf.rawText = buf.rawText.substring(nlr + 1);
-            buf.lineCount -= 1;
+        // the compact ``[LEVEL] msg`` form). Identical lengths after
+        // every append/trim keeps the two views in sync.
+        buf.rawLines.push(line);
+        buf.compactLines.push(compactLogLine(line));
+        // Bulk trim once we drift past 1.5x the soft cap — keeps the
+        // amortized cost of each push at O(1). Per-append shift() would
+        // be O(n) and bring back the freeze under floods.
+        var hardCap = Math.floor(bufferMaxLines * 1.5);
+        if (buf.rawLines.length > hardCap) {
+            var dropN = buf.rawLines.length - bufferMaxLines;
+            buf.rawLines.splice(0, dropN);
+            buf.compactLines.splice(0, dropN);
         }
         // Try to recognize an event for the component-specific
         // taxonomy (signal swap, bet placed, win/loss, etc.).
@@ -316,10 +322,9 @@ ApplicationWindow {
     function ensureBuffer(row, path, componentName) {
         if (!componentBuffers[row]) {
             componentBuffers[row] = {
-                rawText: "",
-                compactText: "",
+                rawLines: [],
+                compactLines: [],
                 events: [],
-                lineCount: 0,
                 lastOffset: -1,
                 path: path,
                 componentName: componentName,
@@ -367,10 +372,9 @@ ApplicationWindow {
             // If the path changed (rare — manifest edit), reset the
             // buffer for that component and force a full re-fetch.
             if (buf.path !== path) {
-                buf.rawText = "";
-                buf.compactText = "";
+                buf.rawLines = [];
+                buf.compactLines = [];
                 buf.events = [];
-                buf.lineCount = 0;
                 buf.lastOffset = -1;
                 buf.path = path;
                 componentTailActive[row] = false;
@@ -381,7 +385,7 @@ ApplicationWindow {
             var resume = (typeof buf.lastOffset === "number" && buf.lastOffset >= 0)
                          ? buf.lastOffset
                          : -1;
-            var historyArg = resume >= 0 ? 0 : Number.MAX_SAFE_INTEGER;
+            var historyArg = resume >= 0 ? 0 : initialTailHistoryBytes;
             agentClient.startLogTail(row, path, "", historyArg, resume);
             componentTailActive[row] = true;
         }
@@ -1269,30 +1273,29 @@ ApplicationWindow {
                         property int miniMaxLines: bufferMaxLines
                         property int miniLineCount: 0
 
+                        // Coalesces N append() calls within one frame into
+                        // a single rebind from componentBuffers[row].compactLines.
+                        // The previous approach did textArea.append() and
+                        // textArea.remove(0, nl+1) per line, which under a
+                        // burst of buffered tail frames was O(n²) on the
+                        // GUI thread — the freeze the operator was seeing.
+                        // Now: per-line work is O(1) (push to JS array in
+                        // appendToBuffer), and the TextEdit is rebuilt at
+                        // most once per ~16ms (one display frame).
+                        Timer {
+                            id: miniRebindTimer
+                            interval: 16
+                            repeat: false
+                            onTriggered: miniLogPane.rebindFromBuffer()
+                        }
+
                         function miniAppend(line) {
-                            if (!line) return;
-                            // Compact ``[lineNo  ]YYYY-MM-DD HH:MM:SS.mmm
-                            // [LEVEL  ] module.path: msg`` → ``[LEVEL] msg``.
-                            // The optional ``lineNo  `` prefix handles the
-                            // live-tail path (onLogTailLine prepends it);
-                            // the bulk-reload path (onLogTailBytes) sends
-                            // raw lines that also match. Time prefix is
-                            // dropped — the mini-log is space-constrained
-                            // and timestamps push the message off-screen.
-                            // Raw pass-through for non-matching lines so
-                            // stack traces and foreign formats still show.
-                            var re = /^(?:\d+\s+)?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \[\s*(\w+)\s*\] [\w.]+:\s*(.*)$/;
-                            var m = line.match(re);
-                            var out = m ? ("[" + m[1] + "] " + m[2]) : line;
-                            if (miniTextArea.length > 0) miniTextArea.append(out);
-                            else miniTextArea.text = out;
-                            miniLineCount += 1;
-                            while (miniLineCount > miniMaxLines) {
-                                var nl = miniTextArea.text.indexOf("\n");
-                                if (nl < 0) break;
-                                miniTextArea.remove(0, nl + 1);
-                                miniLineCount -= 1;
-                            }
+                            // The buffer was already updated by
+                            // appendToBuffer() before this was called;
+                            // we just need to schedule a rebind. Restart
+                            // semantics give us debounced behavior — a
+                            // 1000-line burst becomes one rebind.
+                            miniRebindTimer.restart();
                         }
 
                         function miniLogClear() {
@@ -1318,11 +1321,13 @@ ApplicationWindow {
                         // content appears immediately on row switch.
                         function rebindFromBuffer() {
                             var buf = componentBuffers[root.selectedIndex];
-                            var t = (buf && typeof buf.compactText === "string")
-                                    ? buf.compactText
-                                    : "";
-                            miniTextArea.text = t;
-                            miniLineCount = (buf && buf.lineCount) || 0;
+                            var lines = (buf && Array.isArray(buf.compactLines))
+                                        ? buf.compactLines
+                                        : [];
+                            // Single join() is O(n) once, vs. the per-line
+                            // append+trim path which was O(n²) over a flood.
+                            miniTextArea.text = lines.join("\n");
+                            miniLineCount = lines.length;
                             miniTextArea.cursorPosition = miniTextArea.length;
                             // Snap to bottom on rebind so the operator
                             // sees the most recent lines first.
@@ -1910,17 +1915,20 @@ ApplicationWindow {
         // when we exceed ``maxLines`` without scanning the whole string.
         property int lineCount: 0
 
+        // Coalescing rebind, same rationale as miniRebindTimer above.
+        // The visible overlay is rebuilt from componentBuffers[row].rawLines
+        // at most once per frame; the per-line work upstream stays O(1).
+        Timer {
+            id: tailRebindTimer
+            interval: 16
+            repeat: false
+            onTriggered: logsOverlay.rebindFromBuffer()
+        }
+
         function tailAppend(line) {
-            if (!line) return;
-            if (tailTextArea.length > 0) tailTextArea.append(line);
-            else tailTextArea.text = line;
-            lineCount += 1;
-            while (lineCount > maxLines) {
-                var nl = tailTextArea.text.indexOf("\n");
-                if (nl < 0) break;
-                tailTextArea.remove(0, nl + 1);
-                lineCount -= 1;
-            }
+            // The buffer is updated upstream in appendToBuffer(); this
+            // just schedules a debounced rebind.
+            tailRebindTimer.restart();
         }
 
         function tailClear() {
@@ -1937,9 +1945,9 @@ ApplicationWindow {
         // TextEdit paint stall.
         function rebindFromBuffer() {
             var buf = componentBuffers[root.selectedIndex];
-            var t = (buf && typeof buf.rawText === "string") ? buf.rawText : "";
-            tailTextArea.text = t;
-            lineCount = (buf && buf.lineCount) || 0;
+            var lines = (buf && Array.isArray(buf.rawLines)) ? buf.rawLines : [];
+            tailTextArea.text = lines.join("\n");
+            lineCount = lines.length;
             tailTextArea.cursorPosition = tailTextArea.length;
             logsOverlay.streaming = !!agentClient
                                     && agentClient.connectionState === 3
@@ -1963,21 +1971,18 @@ ApplicationWindow {
                 logsOverlay.streaming = true;
                 logsOverlay.activePath = path;
             }
+            // The buffer is updated by the upstream Connections block
+            // (under miniLogPane) before these handlers fire — the
+            // ordering is FIFO by declaration. We only need to schedule
+            // a debounced rebind from the now-updated buffer; no need
+            // to re-decode bytes or split lines a second time.
             function onLogTailLine(row, lineNo, text) {
                 if (row !== root.selectedIndex) return;
-                logsOverlay.tailAppend(text);
+                tailRebindTimer.restart();
             }
             function onLogTailBytes(row, offset, data) {
                 if (row !== root.selectedIndex) return;
-                var text = data;
-                if (typeof data === "object") {
-                    try { text = new TextDecoder().decode(data); }
-                    catch (e) { text = "" + data; }
-                }
-                var lines = String(text).split(/\r?\n/);
-                for (var i = 0; i < lines.length; ++i) {
-                    if (lines[i].length > 0) logsOverlay.tailAppend(lines[i]);
-                }
+                tailRebindTimer.restart();
             }
             function onLogTailEnded(row, reason) {
                 if (row !== root.selectedIndex) return;
@@ -2111,10 +2116,9 @@ ApplicationWindow {
                             var row = root.selectedIndex;
                             var buf = componentBuffers[row];
                             if (buf) {
-                                buf.rawText = "";
-                                buf.compactText = "";
+                                buf.rawLines = [];
+                                buf.compactLines = [];
                                 buf.events = [];
-                                buf.lineCount = 0;
                                 buf.lastOffset = -1;
                             }
                             logsOverlay.rebindFromBuffer();
@@ -2124,7 +2128,7 @@ ApplicationWindow {
                                 row,
                                 pathField.text,
                                 filterField.text,
-                                Number.MAX_SAFE_INTEGER,
+                                reloadTailHistoryBytes,
                                 -1);
                             // Eagerly mark active so a concurrent
                             // ``ensureAllTails`` (e.g. from a periodic

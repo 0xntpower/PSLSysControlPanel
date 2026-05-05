@@ -14,17 +14,26 @@
 #include <QUuid>
 #include <QtConcurrent/QtConcurrent>
 
+#include <algorithm>
 #include <cstring>
 
 namespace pslcp::net {
 namespace {
 
-constexpr int kReconnectDelayMs = 3000;
+constexpr int kReconnectDelayMsBase = 1000;
+constexpr int kReconnectDelayMsMax = 30000;
 constexpr int kSocketTimeoutMs = 8000;
 constexpr int kMaxFrameBytes = 256 * 1024;
 // Poll the agent's component_list every few seconds while connected so the
 // UI reflects crashes / restarts / new enrollments without manual refresh.
 constexpr int kRefreshIntervalMs = 3000;
+// Process at most this many frames in one onSocketReadyRead/pump call
+// before yielding to the event loop. Keeps the GUI responsive when a
+// network stall releases a flood of buffered frames at once.
+constexpr int kMaxFramesPerPump = 32;
+// Compact recv_buffer_ once the read-cursor passes this watermark.
+// Trades memmove cost against memory footprint of the leading slack.
+constexpr int kRecvBufferCompactWatermark = 64 * 1024;
 
 QByteArray freshReqId()
 {
@@ -38,6 +47,10 @@ AgentClient::AgentClient(QObject* parent)
     , socket_(new QTcpSocket(this))
     , reconnect_timer_(new QTimer(this))
     , refresh_timer_(new QTimer(this))
+    , pump_timer_(new QTimer(this))
+    , recv_consumed_(0)
+    , reconnect_delay_ms_(kReconnectDelayMsBase)
+    , component_list_in_flight_(false)
     , state_(Disconnected)
     , operator_enrolled_(false)
     , operator_auth_in_progress_(false)
@@ -52,7 +65,7 @@ AgentClient::AgentClient(QObject* parent)
     connect(socket_, &QTcpSocket::errorOccurred, this, &AgentClient::onSocketErrorOccurred);
 
     reconnect_timer_->setSingleShot(true);
-    reconnect_timer_->setInterval(kReconnectDelayMs);
+    reconnect_timer_->setInterval(reconnect_delay_ms_);
     connect(reconnect_timer_, &QTimer::timeout, this, &AgentClient::start);
 
     // Refresh timer kicks in when the state machine enters Ready and is
@@ -60,6 +73,12 @@ AgentClient::AgentClient(QObject* parent)
     // keep the component list fresh for the UI.
     refresh_timer_->setInterval(kRefreshIntervalMs);
     connect(refresh_timer_, &QTimer::timeout, this, &AgentClient::refreshComponentList);
+
+    // Continuation timer for pumpFramesFromBuffer; 0ms singleshot returns
+    // control to the event loop between frame batches so the UI can paint.
+    pump_timer_->setSingleShot(true);
+    pump_timer_->setInterval(0);
+    connect(pump_timer_, &QTimer::timeout, this, &AgentClient::pumpFramesFromBuffer);
 }
 
 AgentClient::~AgentClient()
@@ -89,10 +108,13 @@ void AgentClient::start()
         return;
     }
     reconnect_timer_->stop();
+    pump_timer_->stop();
     if (socket_->state() != QAbstractSocket::UnconnectedState) {
         socket_->abort();
     }
     recv_buffer_.clear();
+    recv_consumed_ = 0;
+    component_list_in_flight_ = false;
     components_.clear();
     emit componentListUpdated();
     host_id_.clear();
@@ -119,6 +141,13 @@ void AgentClient::refreshComponentList()
     if (state_ != Ready) {
         return;
     }
+    // Don't pile up another poll while the previous one is still
+    // in flight — under high latency the responses arrive late and
+    // the GUI ends up parsing N stale-but-identical lists in a row.
+    if (component_list_in_flight_) {
+        return;
+    }
+    component_list_in_flight_ = true;
     sendRequest(QStringLiteral("component_list"), {});
 }
 
@@ -538,7 +567,13 @@ void AgentClient::onSocketDisconnected()
     if (state_ != Failed) {
         setState(Disconnected);
     }
-    reconnect_timer_->start();
+    // Exponential backoff: each successive failed attempt waits longer
+    // before retrying, so a flaky network doesn't get hammered with
+    // reconnect storms (which themselves accumulated GUI-thread work).
+    // Reset to base on a successful Ready transition (see setState).
+    reconnect_timer_->start(reconnect_delay_ms_);
+    reconnect_delay_ms_ =
+        std::min(reconnect_delay_ms_ * 2, kReconnectDelayMsMax);
 }
 
 void AgentClient::onSocketErrorOccurred()
@@ -549,26 +584,67 @@ void AgentClient::onSocketErrorOccurred()
 void AgentClient::onSocketReadyRead()
 {
     recv_buffer_.append(socket_->readAll());
-    while (true) {
-        if (recv_buffer_.size() < 4) {
-            return;
+    pumpFramesFromBuffer();
+}
+
+void AgentClient::pumpFramesFromBuffer()
+{
+    int processed = 0;
+    while (processed < kMaxFramesPerPump) {
+        const int available = recv_buffer_.size() - recv_consumed_;
+        if (available < 4) {
+            break;
         }
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(recv_buffer_.constData()) + recv_consumed_;
         const quint32 length =
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[0])) << 24) |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[1])) << 16) |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[2])) << 8)  |
-            (static_cast<quint32>(static_cast<unsigned char>(recv_buffer_[3])));
+            (static_cast<quint32>(p[0]) << 24) |
+            (static_cast<quint32>(p[1]) << 16) |
+            (static_cast<quint32>(p[2]) << 8)  |
+            (static_cast<quint32>(p[3]));
         if (length == 0 || length > kMaxFrameBytes) {
             setError(QStringLiteral("oversize or zero frame (%1)").arg(length));
             socket_->abort();
             return;
         }
-        if (static_cast<quint32>(recv_buffer_.size()) < 4 + length) {
+        if (static_cast<quint32>(available) < 4 + length) {
+            break;
+        }
+        const QByteArray body =
+            QByteArray(recv_buffer_.constData() + recv_consumed_ + 4,
+                       static_cast<int>(length));
+        recv_consumed_ += 4 + static_cast<int>(length);
+        ++processed;
+        handleFrame(body);
+        // handleFrame may have aborted the socket and cleared buffers
+        // (e.g. on bad signature); bail out if state's been torn down.
+        if (state_ == Disconnected || state_ == Failed) {
             return;
         }
-        const QByteArray body = recv_buffer_.mid(4, static_cast<int>(length));
-        recv_buffer_.remove(0, 4 + static_cast<int>(length));
-        handleFrame(body);
+    }
+
+    // Compact lazily — drop the leading consumed slack once it crosses
+    // the watermark, so we don't pay a memmove on every single frame
+    // but also don't hold unbounded leading bytes forever.
+    if (recv_consumed_ >= kRecvBufferCompactWatermark) {
+        recv_buffer_.remove(0, recv_consumed_);
+        recv_consumed_ = 0;
+    }
+
+    // If more complete frames remain past the per-pump cap, yield to
+    // the event loop and resume on the next tick. This is what keeps
+    // the UI responsive when a stall releases a flood of frames.
+    if (recv_buffer_.size() - recv_consumed_ >= 4) {
+        const unsigned char* p =
+            reinterpret_cast<const unsigned char*>(recv_buffer_.constData()) + recv_consumed_;
+        const quint32 next_len =
+            (static_cast<quint32>(p[0]) << 24) |
+            (static_cast<quint32>(p[1]) << 16) |
+            (static_cast<quint32>(p[2]) << 8)  |
+            (static_cast<quint32>(p[3]));
+        if (static_cast<quint32>(recv_buffer_.size() - recv_consumed_) >= 4 + next_len) {
+            pump_timer_->start();
+        }
     }
 }
 
@@ -614,6 +690,7 @@ void AgentClient::handleFrame(const QByteArray& frame_body)
         return;
     }
     if (t == QStringLiteral("component_list.ok")) {
+        component_list_in_flight_ = false;
         components_.clear();
         const QJsonArray arr = r.payload.body.value(QStringLiteral("components")).toArray();
         for (const QJsonValue& v : arr) {
@@ -645,6 +722,11 @@ void AgentClient::handleFrame(const QByteArray& frame_body)
         return;
     }
     if (t.endsWith(QStringLiteral(".err"))) {
+        // Any .err that's a reply to component_list clears the in-flight
+        // gate so the next poll can fire instead of being silently dropped.
+        if (t == QStringLiteral("component_list.err")) {
+            component_list_in_flight_ = false;
+        }
         const QString msg = r.payload.body.value(QStringLiteral("message")).toString();
         const QString code = r.payload.body.value(QStringLiteral("code")).toString();
         if (code == QStringLiteral("bad_op_signature")) {
@@ -687,6 +769,9 @@ void AgentClient::setState(ConnectionState s)
     state_ = s;
     if (s == Ready) {
         refresh_timer_->start();
+        // Successful handshake — reset the backoff so the next outage
+        // starts at base delay again, not whatever it had escalated to.
+        reconnect_delay_ms_ = kReconnectDelayMsBase;
     } else {
         refresh_timer_->stop();
     }
