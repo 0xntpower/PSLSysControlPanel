@@ -55,7 +55,7 @@ int main(int argc, char* argv[])
         // Tailscale IPs are static by design, so hardcoding the fleet here
         // means a double-click launch Just Works. Override with --host when
         // adding a new machine or running against a staging agent.
-        host_values << QStringLiteral("workstation=100.100.100.100:19733")
+        host_values << QStringLiteral("workstation=127.0.0.1:19733")
                     << QStringLiteral("node2=127.0.0.1:19733");
     }
 
