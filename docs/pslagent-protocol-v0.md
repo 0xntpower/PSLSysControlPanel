@@ -62,10 +62,12 @@ Three keys total:
 
 `operator_key = Argon2id(password, agent_salt, mem=256MiB, iters=3, threads=1)`.
 
-Each agent has its own 32-byte `agent_salt`, generated at first-run and stored
-next to the verifier. Same password + different agents → different operator
-keys. Password rotation re-runs Argon2id with a fresh salt and pushes the new
-verifier to each agent via an operator-authed `rotate_verifier` request.
+Each agent has its own 16-byte `agent_salt` (`SALT_BYTES = 16`, the size
+libsodium's `crypto_pwhash` requires), generated at first-run and stored next to
+the verifier. Same password + different agents → different operator keys.
+Password rotation re-runs Argon2id with a fresh salt and re-provisions the new
+verifier to each agent (a `rotate_verifier` message is planned for this — see
+§6.5 — but is not yet implemented; re-enrollment is the current path).
 
 All keys live in the OS credential store (Windows Credential Manager on
 Windows, age-encrypted file on Linux/macOS) alongside the existing
@@ -103,25 +105,28 @@ Every payload — request and response — is wrapped in a signed JSON envelope:
 
 ```json
 {
-  "payload": "<canonical JSON of the inner message>",
-  "nonce":   "<32 hex chars = 128 bits>",
-  "ts":      "<unix seconds, integer>",
-  "sig":     "<64 hex chars = HMAC-SHA256(MANAGER_PSK, ts ‖ nonce ‖ payload_bytes)>",
-  "op_sig":  "<optional, same but keyed by operator_key>"
+  "payload":      "<canonical JSON of the inner message>",
+  "nonce":        "<32 hex chars = 128 bits>",
+  "signature":    "<64 hex chars = HMAC-SHA256(MANAGER_PSK, nonce ‖ payload_bytes)>",
+  "op_signature": "<optional, same but keyed by operator_key>"
 }
 ```
 
 - `payload` is a canonicalized JSON string: UTF-8, `sort_keys=true`,
   `separators=(',', ':')`, no trailing whitespace. This matches the existing
   canonicalization on the signal path.
-- `nonce` is 16 random bytes, hex-encoded. Freshness window: ts must be within
-  ±60 s of server clock. Agent maintains a sliding window of the last 2048
-  nonces and rejects replays.
-- `sig` is **always present**. Verifies panel holds `MANAGER_PSK`.
-- `op_sig` is present on **management requests** (lifecycle, config_set,
+- The HMAC input is **`nonce ‖ payload_bytes`** — there is **no `ts` field in the
+  envelope** and the timestamp is **not** part of the signature. Freshness is
+  enforced from a `timestamp` field **inside the payload** (ISO-8601, must be
+  within ±60 s of the server clock; `TIMESTAMP_MAX_AGE_SEC = 60.0`).
+- `nonce` is 16 random bytes, hex-encoded (32 hex chars). Each connection
+  (session) maintains a sliding window of the last 2048 nonces and rejects
+  replays — the window is **session-local**, not agent-global.
+- `signature` is **always present**. Verifies the panel holds `MANAGER_PSK`.
+- `op_signature` is present on **management requests** (lifecycle, config_set,
   config_get, log_*) and the responses to them. Verifies operator authorization.
   Read-only queries that don't carry sensitive data (`agent_hello`,
-  `agent_ping`, `component_list`) require only `sig`.
+  `agent_ping`, `component_list`) require only `signature`.
 
 Inner payload shape:
 
@@ -171,9 +176,12 @@ req:  { "panel_version": "0.1.0" }
 resp: {
   "agent_version": "0.1.0",
   "host_id": "vps-01",
-  "operator_salt_b64": "<base64, 32 bytes>",
+  "operator_salt_b64": "<base64, 16 bytes>",
   "argon2id": { "mem_kib": 262144, "iters": 3, "threads": 1 },
-  "caps": ["lifecycle", "config", "logs", "rotate_verifier"],
+  "caps": ["hello", "ping", "component_list", "component_start", "component_stop",
+           "component_restart", "component_status", "config_files", "config_get",
+           "config_set", "log_files", "log_range", "log_grep", "log_tail",
+           "operator"],
   "proto_versions": [0]
 }
 ```
@@ -210,15 +218,16 @@ resp: {
 #### `component_start`
 ```
 req:  { "id": "polydatacollector" }
-resp: { "state": "starting", "pid": 4821 }
+resp: { "state": "running", "pid": 4821, "started_at": 1745000000 }
 ```
-State transitions to `running` or `crashed` asynchronously; panel can poll
-with `component_status` or rely on the next `component_list`.
+The supervisor marks the component `running` on spawn; it may transition to
+`crashed` asynchronously. Panel can poll with `component_status` or rely on the
+next `component_list`.
 
 #### `component_stop`
 ```
 req:  { "id": "polydatacollector", "grace_sec": 10 }
-resp: { "state": "stopping" }
+resp: { "state": "stopped", "exit_code": 0 }
 ```
 Agent sends the component's configured `stop_signal` (e.g. SIGTERM /
 CTRL_BREAK_EVENT), waits up to `grace_sec`, then escalates to SIGKILL /
@@ -329,26 +338,29 @@ resp: { "bytes_b64": "...", "next_offset": 65536, "eof": false }
 ```
 
 #### `log_tail` (streaming)
-Opens a separate TCP connection. After the signed `log_tail` request, agent
-pushes unsolicited signed frames:
+After the signed `log_tail` request, the agent pushes unsolicited signed frames
+of type `log_tail.push` (a normal protocol envelope). The new-line fields are
+**flat** in the frame's data object — not nested under a `"match"` key:
 ```
-frame: {
-  "offset": 9123456,
-  "bytes_b64": "..."                              // if no filter_pattern
-  "match":   { "line_no": N, "text": "..." }      // if filter_pattern is set
+frame data: {
+  "line_no": N,
+  "text":    "..."
 }
 ```
-Connection stays open until panel closes it, or agent closes on error /
-rotation.
+The agent polls the file and emits a frame per new matching line. Connection
+stays open until the panel closes it, or the agent closes on error.
 
 ### 6.5 Meta (sig + op_sig)
 
 #### `rotate_verifier`
-Pushes a new `{salt, verifier}` pair. Signed under both current operator_key
-and MANAGER_PSK (the current verifier) to prevent a network attacker who
-somehow has `MANAGER_PSK` from re-enrolling. After success, agent's stored
-verifier is updated. Any open panel sessions on the old key continue until
-next reconnect.
+> **Not implemented in v0.** This message type is reserved/planned — it is not
+> registered by the agent and not advertised in `agent_hello` caps. The text
+> below describes the intended design.
+
+Pushes a new `{salt, verifier}` pair, signed under both the current operator_key
+and MANAGER_PSK (the current verifier) to prevent a network attacker who somehow
+has `MANAGER_PSK` from re-enrolling. After success the agent's stored verifier is
+updated. Any open panel sessions on the old key continue until next reconnect.
 
 ---
 
