@@ -52,11 +52,10 @@ int main(int argc, char* argv[])
         static_cast<quint16>(parser.value(portOpt).toUInt());
     QStringList host_values = parser.values(hostOpt);
     if (host_values.isEmpty()) {
-        // Tailscale IPs are static by design, so hardcoding the fleet here
-        // means a double-click launch Just Works. Override with --host when
-        // adding a new machine or running against a staging agent.
-        host_values << QStringLiteral("workstation=127.0.0.1:19733")
-                    << QStringLiteral("node2=127.0.0.1:19733");
+        // No --host given: default to a single local agent so a fresh
+        // checkout launches without configuration. Pass --host one or more
+        // times (e.g. --host "node1=10.0.0.5:19733") to target your own fleet.
+        host_values << QStringLiteral("local=127.0.0.1:19733");
     }
 
     pslcp::net::HostManager host_manager;

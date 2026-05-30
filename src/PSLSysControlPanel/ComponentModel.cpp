@@ -37,11 +37,11 @@ ComponentModel::ComponentModel(QObject* parent)
     , agent_client_(nullptr)
 {
     const QList<std::tuple<QString, QString, ComponentStatus, double, double>> seed{
-        {"PolyDataCollector",   "vps-01",   ComponentStatus::Running,  142.0, 8.1},
-        {"PolyTraderLightning", "vps-01",   ComponentStatus::Running,   18.3, 4.4},
-        {"PolySignalEngine",    "workstation-01",       ComponentStatus::Running,   62.7, 21.5},
-        {"PolyLiveVisualizer",  "workstation-01",       ComponentStatus::Degraded,   9.8, 2.6},
-        {"SignalOrchestrator",  "vps-01",   ComponentStatus::Stopped,    0.0, 0.0},
+        {"PolyDataCollector",   "vps-01",          ComponentStatus::Running,  142.0, 8.1},
+        {"PolyTraderLightning", "vps-01",          ComponentStatus::Running,   18.3, 4.4},
+        {"PolySignalEngine",    "workstation-01",  ComponentStatus::Running,   62.7, 21.5},
+        {"PolyLiveVisualizer",  "workstation-01",  ComponentStatus::Degraded,   9.8, 2.6},
+        {"SignalOrchestrator",  "vps-01",          ComponentStatus::Stopped,    0.0, 0.0},
     };
 
     int i = 0;
