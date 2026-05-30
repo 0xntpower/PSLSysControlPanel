@@ -9,7 +9,7 @@
 
 ## 1. Architecture
 
-Each host that runs PSL components (workstation, remote VPS, ...) runs exactly
+Each host that runs PSL components (e.g. a local workstation, a remote VPS, ...) runs exactly
 one `PSLAgent` process. The agent is the sole authority on its host for
 lifecycle management (start / stop / restart), configuration reads and writes,
 and log access.
@@ -197,7 +197,7 @@ resp: {
       "state": "running" | "starting" | "stopping" | "stopped" | "crashed",
       "pid": 4821,
       "started_at": 1745000000,
-      "telemetry_endpoint": "vps-01.ts.net:19732",
+      "telemetry_endpoint": "vps-01.internal:19732",
       "last_exit_code": null
     },
     ...

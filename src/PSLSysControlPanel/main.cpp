@@ -20,17 +20,17 @@ int main(int argc, char* argv[])
     QCommandLineParser parser;
     parser.setApplicationDescription(
         "PSLSysControlPanel\n\n"
-        "Connects to one or more PSLAgent hosts over Tailscale.\n"
-        "Defaults to the PolySignalLab fleet (workstation + node2) when no\n"
-        "--host is given; pass --host to override.\n"
-        "Single host:  --host workstation --port 19733\n"
-        "Multi host:   --host workstation=10.0.0.1:19733 --host node2=10.0.0.2:19733");
+        "Connects to one or more PSLAgent hosts (typically over a LAN or\n"
+        "VPN such as Tailscale). Defaults to a single local agent when no\n"
+        "--host is given; pass --host to target your own machines.\n"
+        "Single host:  --host node1 --port 19733\n"
+        "Multi host:   --host node1=10.0.0.1:19733 --host node2=10.0.0.2:19733");
     parser.addHelpOption();
     QCommandLineOption hostOpt(
         QStringList() << "host",
         "Agent host as a bare hostname, ``host:port``, or ``name=host:port``. "
         "Pass multiple times to show several hosts in one panel. If omitted, "
-        "the panel connects to the hardcoded workstation + node2 Tailscale IPs.",
+        "the panel connects to a single local agent at 127.0.0.1:19733.",
         "host");
     QCommandLineOption portOpt(
         QStringList() << "port",

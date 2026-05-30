@@ -1,8 +1,8 @@
 #pragma once
 
 // Manages N (host, port) target sessions so the operator can flip between
-// several machines (e.g. a workstation and a remote VPS) inside a single panel
-// window. Each session owns its own AgentClient + ComponentModel pair; the
+// several machines (e.g. a workstation and a remote VPS) inside a single
+// panel window. Each session owns its own AgentClient + ComponentModel pair; the
 // one exposed to QML switches atomically when ``currentIndex`` changes.
 
 #include <QList>
